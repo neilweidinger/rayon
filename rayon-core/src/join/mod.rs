@@ -150,6 +150,9 @@ where
         // pushed on top of it in the stack, and we will have to pop
         // those off to get to it.
         while !job_b.latch.probe() {
+            // job_b.latch may be set by another worker thread if it steals job_b, and calls Job::execute() on it.
+            // This is needed (I think) so that in case it doesn't get stolen, we can ensure here
+            // in join() that job_b gets completed.
             if let Some(job) = worker_thread.take_local_job() {
                 if job == job_b_ref {
                     // Found it! Let's run it.

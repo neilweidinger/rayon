@@ -38,7 +38,7 @@ pub(super) enum Event {
         terminate_addr: usize,
     },
 
-    /// Indicates that a worker thread started execution.
+    /// Indicates that a worker thread terminated execution.
     ThreadTerminate { worker: usize },
 
     /// Indicates that a worker thread became idle, blocked on `latch_addr`.
@@ -140,9 +140,9 @@ impl Logger {
             panic!("RAYON_LOG should be 'tail:<file>' or 'profile:<file>'");
         }
 
-        return Logger {
+        Logger {
             sender: Some(sender),
-        };
+        }
     }
 
     fn disabled() -> Logger {
@@ -301,8 +301,8 @@ struct SimulatorState {
 impl SimulatorState {
     fn new(num_workers: usize) -> Self {
         Self {
-            local_queue_size: (0..num_workers).map(|_| 0).collect(),
-            thread_states: (0..num_workers).map(|_| State::Working).collect(),
+            local_queue_size: vec![0; num_workers],
+            thread_states: vec![State::Working; num_workers],
             injector_size: 0,
         }
     }

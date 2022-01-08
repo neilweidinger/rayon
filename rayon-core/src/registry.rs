@@ -457,6 +457,9 @@ impl Registry {
 
         LOCK_LATCH.with(|l| {
             // This thread isn't a member of *any* thread pool, so just block.
+            // We can have this assert here since to have called in_worker_cold in the first place,
+            // we must have checked to see if WorkerThread::current() is null earlier when
+            // executing module::in_worker.
             debug_assert!(WorkerThread::current().is_null());
             let job = StackJob::new(
                 |injected| {
@@ -711,6 +714,8 @@ impl WorkerThread {
         let abort_guard = unwind::AbortIfPanic;
 
         let mut idle_state = self.registry.sleep.start_looking(self.index, latch);
+
+        // main scheduling loop takes place here!
         while !latch.probe() {
             // Try to find some work to do. We give preference first
             // to things in our local deque, then in other workers
@@ -797,6 +802,10 @@ impl WorkerThread {
 /// ////////////////////////////////////////////////////////////////////////
 
 unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usize) {
+    // this is the only time a WorkerThread is created: this struct represents the state for the
+    // current thread running the main loop function, and is used in another functions to retrieve
+    // the currently running thread (currently running thread stored in thread local
+    // WORKER_THREAD_STATE)
     let worker_thread = &WorkerThread {
         worker,
         fifo: JobFifo::new(),
@@ -830,7 +839,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
         worker: index,
         terminate_addr: my_terminate_latch.as_core_latch().addr(),
     });
-    worker_thread.wait_until(my_terminate_latch);
+    worker_thread.wait_until(my_terminate_latch); // enter main scheduling loop
 
     // Should not be any work left in our queue.
     debug_assert!(worker_thread.take_local_job().is_none());
