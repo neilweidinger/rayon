@@ -168,6 +168,64 @@ where
     }
 }
 
+pub(super) struct HeapReturnJob<BODY, R, L>
+where
+    BODY: FnOnce() -> R + Send,
+    R: Send,
+    L: Latch + Sync,
+{
+    job: UnsafeCell<Option<BODY>>,
+    result: UnsafeCell<JobResult<R>>,
+    pub(super) latch: L
+}
+
+impl<BODY, R, L> HeapReturnJob<BODY, R, L>
+where
+    BODY: FnOnce() -> R + Send,
+    R: Send,
+    L: Latch + Sync,
+{
+    pub(super) fn new(func: BODY, latch: L) -> Self {
+        HeapReturnJob {
+            job: UnsafeCell::new(Some(func)),
+            result: UnsafeCell::new(JobResult::None),
+            latch
+        }
+    }
+
+    /// Creates a `JobRef` from this job -- note that this hides all
+    /// lifetimes, so it is up to you to ensure that this JobRef
+    /// doesn't outlive any data that it closes over.
+    pub(super) unsafe fn as_job_ref(self: &Box<Self>) -> JobRef {
+        let this: *const Self = mem::transmute_copy(self);
+        JobRef::new(this)
+    }
+
+    pub(super) unsafe fn into_result(self: Box<Self>) -> R {
+        self.result.into_inner().into_return_value()
+    }
+}
+
+impl<BODY, R, L> Job for HeapReturnJob<BODY, R, L>
+where
+    BODY: FnOnce() -> R + Send,
+    R: Send,
+    L: Latch + Sync,
+{
+    unsafe fn execute(this: *const Self) {
+        let this: Box<Self> = mem::transmute(this);
+        let abort = unwind::AbortIfPanic;
+        let func = (*this.job.get()).take().unwrap();
+        (*this.result.get()) = match unwind::halt_unwinding(func) {
+            Ok(x) => JobResult::Ok(x),
+            Err(x) => JobResult::Panic(x),
+        };
+        this.latch.set();
+        mem::forget(abort);
+        mem::forget(this); // don't double free box
+    }
+}
+
 impl<T> JobResult<T> {
     /// Convert the `JobResult` for a job that has finished (and hence
     /// its JobResult is populated) into its return value.

@@ -93,6 +93,8 @@ pub(super) enum Event {
     /// A job was removed from the global queue.
     JobUninjected { worker: usize },
 
+    JobExecuted { worker: usize },
+
     /// When announcing a job, this was the value of the counters we observed.
     ///
     /// No effect on thread state, just a debugging event.
@@ -259,11 +261,15 @@ impl Logger {
     }
 
     fn all_logger_thread(num_workers: usize, receiver: Receiver<Event>) {
-        let stderr = std::io::stderr();
+        let log_filename = "out.txt";
+        let file = File::create(log_filename)
+            .unwrap_or_else(|err| panic!("failed to open `{}`: {}", log_filename, err));
+
         let mut state = SimulatorState::new(num_workers);
+        let mut writer = BufWriter::new(file);
+
 
         for event in receiver {
-            let mut writer = BufWriter::new(stderr.lock());
             state.simulate(&event);
             state.dump(&mut writer, &event).unwrap();
             writer.flush().unwrap();

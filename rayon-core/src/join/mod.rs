@@ -1,4 +1,4 @@
-use crate::job::StackJob;
+use crate::job::HeapReturnJob;
 use crate::latch::SpinLatch;
 use crate::registry::{self, WorkerThread};
 use crate::unwind;
@@ -120,59 +120,37 @@ where
     RB: Send,
 {
     #[inline]
-    fn call_a<R>(f: impl FnOnce(FnContext) -> R, injected: bool) -> impl FnOnce() -> R {
+    fn call<R>(f: impl FnOnce(FnContext) -> R, injected: bool) -> impl FnOnce() -> R {
         move || f(FnContext::new(injected))
-    }
-
-    #[inline]
-    fn call_b<R>(f: impl FnOnce(FnContext) -> R) -> impl FnOnce(bool) -> R {
-        move |migrated| f(FnContext::new(migrated))
     }
 
     registry::in_worker(|worker_thread, injected| unsafe {
         // Create virtual wrapper for task b; this all has to be
         // done here so that the stack frame can keep it all live
         // long enough.
-        let job_b = StackJob::new(call_b(oper_b), SpinLatch::new(worker_thread));
+        let job_b_latch = SpinLatch::new(worker_thread);
+        let job_b = Box::new(HeapReturnJob::new(call(oper_b, injected), job_b_latch));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
-        // Execute task a; hopefully b gets stolen in the meantime.
-        let status_a = unwind::halt_unwinding(call_a(oper_a, injected));
-        let result_a = match status_a {
-            Ok(v) => v,
-            Err(err) => join_recover_from_panic(worker_thread, &job_b.latch, err),
-        };
+        let job_a_latch = SpinLatch::new(worker_thread);
+        let job_a = Box::new(HeapReturnJob::new(call(oper_a, injected), job_a_latch));
+        let job_a_ref = job_a.as_job_ref();
+        worker_thread.push(job_a_ref);
 
-        // Now that task A has finished, try to pop job B from the
-        // local stack.  It may already have been popped by job A; it
-        // may also have been stolen. There may also be some tasks
-        // pushed on top of it in the stack, and we will have to pop
-        // those off to get to it.
-        while !job_b.latch.probe() {
-            // job_b.latch may be set by another worker thread if it steals job_b, and calls Job::execute() on it.
-            // This is needed (I think) so that in case it doesn't get stolen, we can ensure here
-            // in join() that job_b gets completed.
-            if let Some(job) = worker_thread.take_local_job() {
-                if job == job_b_ref {
-                    // Found it! Let's run it.
-                    //
-                    // Note that this could panic, but it's ok if we unwind here.
-                    let result_b = job_b.run_inline(injected);
-                    return (result_a, result_b);
-                } else {
-                    worker_thread.execute(job);
-                }
-            } else {
-                // Local deque is empty. Time to steal from other
-                // threads.
-                worker_thread.wait_until(&job_b.latch);
-                debug_assert!(job_b.latch.probe());
-                break;
-            }
-        }
+        // TODO: see if stolen/injected/migrated bool is correct, log bool when only using one
+        // thread. Do this because I'm not sure why StackJob::new requires an impl FnOnce(bool)
+        // (instead of impl FnOnce()) and is executed by StackJob::execute which hardcodes a true
+        // value to indicate that the job is apparently stolen. StackJob::run_inline accepts a bool
+        // stolen parameter that can be false, however (original join implementation with the while
+        // loop used this and passed a false value), so perhaps we need to figure out a way to make
+        // StackJob::execute more like this (i.e. be abel to pass false stolen bool values).
 
-        (result_a, job_b.into_result())
+        worker_thread.wait_until(&job_a.latch); // Wait on job a latch first, since job a will be popped before job b and correspondingly have its latch set first
+        worker_thread.wait_until(&job_b.latch);
+        debug_assert!(job_a.latch.probe() && job_b.latch.probe());
+
+        (job_a.into_result(), job_b.into_result())
     })
 }
 
