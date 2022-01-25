@@ -883,7 +883,8 @@ where
             // invalidated until we return.
             op(&*owner_thread, false)
         } else {
-            global_registry().in_worker_cold(op)
+            global_registry().in_worker_cold(op) // This is where the global threadpool gets created
+                                                 // when first calling something like join.
         }
     }
 }
