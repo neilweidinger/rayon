@@ -91,18 +91,21 @@ where
     // executed. This ref is decremented at the (*) below.
     registry.increment_terminate_count();
 
-    Box::new(HeapJob::new({
-        let registry = registry.clone();
-        move || {
-            match unwind::halt_unwinding(func) {
-                Ok(()) => {}
-                Err(err) => {
-                    registry.handle_panic(err);
+    Box::new(HeapJob::new(
+        {
+            let registry = registry.clone();
+            move || {
+                match unwind::halt_unwinding(func) {
+                    Ok(()) => {}
+                    Err(err) => {
+                        registry.handle_panic(err);
+                    }
                 }
+                registry.terminate(); // (*) permit registry to terminate now
             }
-            registry.terminate(); // (*) permit registry to terminate now
-        }
-    }))
+        },
+        true,
+    ))
     .as_job_ref()
 }
 

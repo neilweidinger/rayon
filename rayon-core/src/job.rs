@@ -20,7 +20,8 @@ pub(super) trait Job {
     /// Unsafe: this may be called from a different thread than the one
     /// which scheduled the job, so the implementer must ensure the
     /// appropriate traits are met, whether `Send`, `Sync`, or both.
-    unsafe fn execute(this: *const Self);
+    unsafe fn execute(this: *const Self, injected: bool);
+    fn injected(&self) -> bool;
 }
 
 /// Effectively a Job trait object. Each JobRef **must** be executed
@@ -32,7 +33,8 @@ pub(super) trait Job {
 #[derive(Copy, Clone, Debug, PartialEq, Eq)]
 pub(super) struct JobRef {
     pointer: *const (),
-    execute_fn: unsafe fn(*const ()),
+    execute_fn: unsafe fn(*const (), bool),
+    pub(super) injected: bool,
 }
 
 unsafe impl Send for JobRef {}
@@ -45,18 +47,20 @@ impl JobRef {
     where
         T: Job,
     {
-        let fn_ptr: unsafe fn(*const T) = <T as Job>::execute;
+        let fn_ptr: unsafe fn(*const T, bool) = <T as Job>::execute;
+        let injected = <T as Job>::injected(&*data);
 
         // erase types:
         JobRef {
             pointer: data as *const (),
             execute_fn: mem::transmute(fn_ptr),
+            injected,
         }
     }
 
     #[inline]
     pub(super) unsafe fn execute(&self) {
-        (self.execute_fn)(self.pointer)
+        (self.execute_fn)(self.pointer, self.injected)
     }
 }
 
@@ -73,6 +77,7 @@ where
     pub(super) latch: L,
     func: UnsafeCell<Option<F>>,
     result: UnsafeCell<JobResult<R>>,
+    injected: bool,
 }
 
 impl<L, F, R> StackJob<L, F, R>
@@ -81,11 +86,12 @@ where
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    pub(super) fn new(func: F, latch: L) -> StackJob<L, F, R> {
+    pub(super) fn new(func: F, latch: L, injected: bool) -> StackJob<L, F, R> {
         StackJob {
             latch,
             func: UnsafeCell::new(Some(func)),
             result: UnsafeCell::new(JobResult::None),
+            injected,
         }
     }
 
@@ -108,20 +114,24 @@ where
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    unsafe fn execute(this: *const Self) {
-        fn call<R>(func: impl FnOnce(bool) -> R) -> impl FnOnce() -> R {
-            move || func(true)
+    unsafe fn execute(this: *const Self, injected: bool) {
+        fn call<R>(func: impl FnOnce(bool) -> R, injected: bool) -> impl FnOnce() -> R {
+            move || func(injected)
         }
 
         let this = &*this;
         let abort = unwind::AbortIfPanic;
         let func = (*this.func.get()).take().unwrap();
-        (*this.result.get()) = match unwind::halt_unwinding(call(func)) {
+        (*this.result.get()) = match unwind::halt_unwinding(call(func, injected)) {
             Ok(x) => JobResult::Ok(x),
             Err(x) => JobResult::Panic(x),
         };
         this.latch.set();
         mem::forget(abort);
+    }
+
+    fn injected(&self) -> bool {
+        self.injected
     }
 }
 
@@ -136,15 +146,17 @@ where
     BODY: FnOnce() + Send,
 {
     job: UnsafeCell<Option<BODY>>,
+    injected: bool,
 }
 
 impl<BODY> HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    pub(super) fn new(func: BODY) -> Self {
+    pub(super) fn new(func: BODY, injected: bool) -> Self {
         HeapJob {
             job: UnsafeCell::new(Some(func)),
+            injected,
         }
     }
 
@@ -161,10 +173,14 @@ impl<BODY> Job for HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    unsafe fn execute(this: *const Self) {
+    unsafe fn execute(this: *const Self, _: bool) {
         let this: Box<Self> = mem::transmute(this);
         let job = (*this.job.get()).take().unwrap();
         job();
+    }
+
+    fn injected(&self) -> bool {
+        self.injected
     }
 }
 
@@ -204,7 +220,7 @@ impl JobFifo {
 }
 
 impl Job for JobFifo {
-    unsafe fn execute(this: *const Self) {
+    unsafe fn execute(this: *const Self, _: bool) {
         // We "execute" a queue by executing its first job, FIFO.
         loop {
             match (*this).inner.steal() {
@@ -213,5 +229,9 @@ impl Job for JobFifo {
                 Steal::Retry => {}
             }
         }
+    }
+
+    fn injected(&self) -> bool {
+        false // TODO: check if this really makes sense
     }
 }

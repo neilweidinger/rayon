@@ -363,10 +363,11 @@ impl Registry {
     /// Push a job into the given `registry`. If we are running on a
     /// worker thread for the registry, this will push onto the
     /// deque. Else, it will inject from the outside (which is slower).
-    pub(super) fn inject_or_push(&self, job_ref: JobRef) {
+    pub(super) fn inject_or_push(&self, mut job_ref: JobRef) {
         let worker_thread = WorkerThread::current();
         unsafe {
             if !worker_thread.is_null() && (*worker_thread).registry().id() == self.id() {
+                job_ref.injected = false;
                 (*worker_thread).push(job_ref);
             } else {
                 self.inject(&[job_ref]);
@@ -465,9 +466,10 @@ impl Registry {
                 |injected| {
                     let worker_thread = WorkerThread::current();
                     assert!(injected && !worker_thread.is_null());
-                    op(&*worker_thread, true)
+                    op(&*worker_thread, injected)
                 },
                 l,
+                true,
             );
             self.inject(&[job.as_job_ref()]);
             job.latch.wait_and_reset(); // Make sure we can use the same latch again next time.
@@ -493,9 +495,10 @@ impl Registry {
             |injected| {
                 let worker_thread = WorkerThread::current();
                 assert!(injected && !worker_thread.is_null());
-                op(&*worker_thread, true)
+                op(&*worker_thread, injected)
             },
             latch,
+            true,
         );
         self.inject(&[job.as_job_ref()]);
         current_thread.wait_until(&job.latch);
@@ -671,6 +674,7 @@ impl WorkerThread {
 
     #[inline]
     pub(super) unsafe fn push_fifo(&self, job: JobRef) {
+        // TODO: check if we need to update job.injected
         self.push(self.fifo.push(job));
     }
 
@@ -722,11 +726,25 @@ impl WorkerThread {
             // deques, and finally to injected jobs from the
             // outside. The idea is to finish what we started before
             // we take on something new.
-            if let Some(job) = self
+
+            let job = self
                 .take_local_job()
-                .or_else(|| self.steal())
-                .or_else(|| self.registry.pop_injected_job(self.index))
-            {
+                .or_else(|| {
+                    self.steal().map(|mut stolen_job| {
+                        stolen_job.injected = true;
+                        stolen_job
+                    })
+                })
+                .or_else(|| {
+                    self.registry
+                        .pop_injected_job(self.index)
+                        .map(|mut injected_job| {
+                            injected_job.injected = true;
+                            injected_job
+                        })
+                });
+
+            if let Some(job) = job {
                 self.registry.sleep.work_found(idle_state);
                 self.execute(job);
                 idle_state = self.registry.sleep.start_looking(self.index, latch);
