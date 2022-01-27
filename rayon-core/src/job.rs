@@ -21,7 +21,6 @@ pub(super) trait Job {
     /// which scheduled the job, so the implementer must ensure the
     /// appropriate traits are met, whether `Send`, `Sync`, or both.
     unsafe fn execute(this: *const Self, injected: bool);
-    fn injected(&self) -> bool;
 }
 
 /// Effectively a Job trait object. Each JobRef **must** be executed
@@ -34,7 +33,6 @@ pub(super) trait Job {
 pub(super) struct JobRef {
     pointer: *const (),
     execute_fn: unsafe fn(*const (), bool),
-    pub(super) injected: bool,
 }
 
 unsafe impl Send for JobRef {}
@@ -48,19 +46,17 @@ impl JobRef {
         T: Job,
     {
         let fn_ptr: unsafe fn(*const T, bool) = <T as Job>::execute;
-        let injected = <T as Job>::injected(&*data);
 
         // erase types:
         JobRef {
             pointer: data as *const (),
             execute_fn: mem::transmute(fn_ptr),
-            injected,
         }
     }
 
     #[inline]
-    pub(super) unsafe fn execute(&self) {
-        (self.execute_fn)(self.pointer, self.injected)
+    pub(super) unsafe fn execute(&self, injected: bool) {
+        (self.execute_fn)(self.pointer, injected)
     }
 }
 
@@ -122,16 +118,16 @@ where
         let this = &*this;
         let abort = unwind::AbortIfPanic;
         let func = (*this.func.get()).take().unwrap();
-        (*this.result.get()) = match unwind::halt_unwinding(call(func, injected)) {
-            Ok(x) => JobResult::Ok(x),
-            Err(x) => JobResult::Panic(x),
-        };
+        (*this.result.get()) =
+            // If the injected parameter we receive is true, then this job has definitely
+            // been injected and we pass this to the function. Otherwise, we fall back to
+            // whatever boolean value this job was created with: (*this).injected.
+            match unwind::halt_unwinding(call(func, injected || (*this).injected)) {
+                Ok(x) => JobResult::Ok(x),
+                Err(x) => JobResult::Panic(x),
+            };
         this.latch.set();
         mem::forget(abort);
-    }
-
-    fn injected(&self) -> bool {
-        self.injected
     }
 }
 
@@ -146,17 +142,15 @@ where
     BODY: FnOnce() + Send,
 {
     job: UnsafeCell<Option<BODY>>,
-    injected: bool,
 }
 
 impl<BODY> HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    pub(super) fn new(func: BODY, injected: bool) -> Self {
+    pub(super) fn new(func: BODY) -> Self {
         HeapJob {
             job: UnsafeCell::new(Some(func)),
-            injected,
         }
     }
 
@@ -177,10 +171,6 @@ where
         let this: Box<Self> = mem::transmute(this);
         let job = (*this.job.get()).take().unwrap();
         job();
-    }
-
-    fn injected(&self) -> bool {
-        self.injected
     }
 }
 
@@ -220,18 +210,14 @@ impl JobFifo {
 }
 
 impl Job for JobFifo {
-    unsafe fn execute(this: *const Self, _: bool) {
+    unsafe fn execute(this: *const Self, injected: bool) {
         // We "execute" a queue by executing its first job, FIFO.
         loop {
             match (*this).inner.steal() {
-                Steal::Success(job_ref) => break job_ref.execute(),
+                Steal::Success(job_ref) => break job_ref.execute(injected),
                 Steal::Empty => panic!("FIFO is empty"),
                 Steal::Retry => {}
             }
         }
-    }
-
-    fn injected(&self) -> bool {
-        false // TODO: check if this really makes sense
     }
 }

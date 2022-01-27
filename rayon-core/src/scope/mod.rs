@@ -540,10 +540,9 @@ impl<'scope> Scope<'scope> {
     {
         self.base.increment();
         unsafe {
-            let job_ref = Box::new(HeapJob::new(
-                move || self.base.execute_job(move || body(self)),
-                true,
-            ))
+            let job_ref = Box::new(HeapJob::new(move || {
+                self.base.execute_job(move || body(self))
+            }))
             .as_job_ref();
 
             // Since `Scope` implements `Sync`, we can't be sure that we're still in a
@@ -582,10 +581,9 @@ impl<'scope> ScopeFifo<'scope> {
     {
         self.base.increment();
         unsafe {
-            let job_ref = Box::new(HeapJob::new(
-                move || self.base.execute_job(move || body(self)),
-                true,
-            ))
+            let job_ref = Box::new(HeapJob::new(move || {
+                self.base.execute_job(move || body(self))
+            }))
             .as_job_ref();
 
             // If we're in the pool, use our scope's private fifo for this thread to execute
@@ -593,7 +591,6 @@ impl<'scope> ScopeFifo<'scope> {
             match self.base.registry.current_thread() {
                 Some(worker) => {
                     let fifo = &self.fifos[worker.index()];
-                    // TODO: check if we need to update job_ref.injected
                     worker.push(fifo.push(job_ref));
                 }
                 None => self.base.registry.inject(&[job_ref]),
