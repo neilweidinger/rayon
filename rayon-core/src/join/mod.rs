@@ -1,8 +1,9 @@
-use crate::job::StackJob;
+use crate::job::{StackJob, TaskJob};
 use crate::latch::SpinLatch;
 use crate::registry::{self, WorkerThread};
 use crate::unwind;
 use std::any::Any;
+use std::future::Future;
 
 use crate::FnContext;
 
@@ -108,7 +109,7 @@ where
 /// Identical to `join`, except that the closures have a parameter
 /// that provides context for the way the closure has been called,
 /// especially indicating whether they're executing on a different
-/// thread than where `join_context` was called.  This will occur if
+/// thread than where `join_context` was called. This will occur if
 /// the second job is stolen by a different thread, or if
 /// `join_context` was called from outside the thread pool to begin
 /// with.
@@ -133,6 +134,76 @@ where
         worker_thread.push(job_b_ref);
 
         let job_a = StackJob::new(call(oper_a), SpinLatch::new(worker_thread), injected);
+        let job_a_ref = job_a.as_job_ref();
+        worker_thread.push(job_a_ref);
+
+        worker_thread.wait_until(&job_a.latch); // Wait on job a latch first, since job a will be popped before job b and correspondingly have its latch set first
+        worker_thread.wait_until(&job_b.latch);
+        debug_assert!(job_a.latch.probe() && job_b.latch.probe());
+
+        (job_a.into_result(), job_b.into_result())
+    })
+}
+
+async fn example() -> i32 {
+    // do compute bound work
+    // .await something (IO bound), would otherwise be blocking
+    // do more compute bound work
+
+    7 // return final value
+}
+
+/// TODO: docs
+pub fn join_async<A, B, RA, RB>(
+    oper_a: A,
+    oper_b: B,
+) -> (<RA as Future>::Output, <RB as Future>::Output)
+where
+    A: FnOnce() -> RA + Send,
+    B: FnOnce() -> RB + Send,
+    RA: Future,
+    RB: Future,
+    <RA as Future>::Output: Send,
+    <RB as Future>::Output: Send,
+{
+    #[inline]
+    fn call<R>(f: impl FnOnce() -> R) -> impl FnOnce(FnContext) -> R {
+        move |_| f()
+    }
+
+    join_context_async(call(oper_a), call(oper_b))
+}
+
+/// TODO: docs
+pub fn join_context_async<A, B, RA, RB>(
+    oper_a: A,
+    oper_b: B,
+) -> (<RA as Future>::Output, <RB as Future>::Output)
+where
+    A: FnOnce(FnContext) -> RA + Send,
+    B: FnOnce(FnContext) -> RB + Send,
+    RA: Future,
+    RB: Future,
+    <RA as Future>::Output: Send,
+    <RB as Future>::Output: Send,
+{
+    #[inline]
+    fn call<R>(f: impl FnOnce(FnContext) -> R) -> impl FnOnce(bool) -> R {
+        move |migrated| f(FnContext::new(migrated))
+    }
+
+    registry::in_worker(|worker_thread, injected| unsafe {
+        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
+        // Future gets moved into job and lives there.
+        let future_b = call(oper_b)(injected);
+        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread), injected);
+        let job_b_ref = job_b.as_job_ref();
+        worker_thread.push(job_b_ref);
+
+        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up
+        // Future gets moved into job and lives there.
+        let future_a = call(oper_a)(injected);
+        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread), injected);
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 

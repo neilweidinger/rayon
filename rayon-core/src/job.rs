@@ -3,7 +3,10 @@ use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
 use std::cell::UnsafeCell;
+use std::future::Future;
 use std::mem;
+use std::pin::Pin;
+use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub(super) enum JobResult<T> {
     None,
@@ -185,6 +188,82 @@ impl<T> JobResult<T> {
             JobResult::Ok(x) => x,
             JobResult::Panic(x) => unwind::resume_unwinding(x),
         }
+    }
+}
+
+// Represents top level task
+pub(super) struct TaskJob<L, F>
+where
+    L: Latch + Sync,
+    F: Future,
+{
+    pub(super) latch: L,
+    future: UnsafeCell<F>,
+    result: UnsafeCell<JobResult<F::Output>>,
+    injected: bool,
+}
+
+impl<L, F> TaskJob<L, F>
+where
+    L: Latch + Sync,
+    F: Future,
+{
+    pub(super) fn new(future: F, latch: L, injected: bool) -> Self {
+        Self {
+            latch,
+            future: UnsafeCell::new(future),
+            result: UnsafeCell::new(JobResult::None),
+            injected,
+        }
+    }
+
+    pub(super) unsafe fn as_job_ref(&self) -> JobRef {
+        JobRef::new(self)
+    }
+
+    pub(super) unsafe fn into_result(self) -> F::Output {
+        self.result.into_inner().into_return_value()
+    }
+}
+
+fn raw_dummy_waker() -> RawWaker {
+    fn no_op(_: *const ()) {}
+    fn clone(_: *const ()) -> RawWaker {
+        raw_dummy_waker()
+    }
+
+    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
+    RawWaker::new(0 as *const (), vtable)
+}
+
+fn dummy_waker() -> Waker {
+    unsafe { Waker::from_raw(raw_dummy_waker()) }
+}
+
+impl<L, F> Job for TaskJob<L, F>
+where
+    L: Latch + Sync,
+    F: Future,
+{
+    unsafe fn execute(this: *const Self, _: bool) {
+        let this = &*this;
+        let abort = unwind::AbortIfPanic;
+
+        // should probably wrap poll in halt_unwinding
+        match Future::poll(
+            Pin::new_unchecked(&mut *this.future.get()),
+            &mut Context::from_waker(&dummy_waker()),
+        ) {
+            Poll::Ready(x) => {
+                *(this.result.get()) = JobResult::Ok(x);
+                this.latch.set();
+            }
+            Poll::Pending => {
+                // pretty sure this is where we want to do 'if f is not ready' block in paper
+            }
+        }
+
+        mem::forget(abort);
     }
 }
 
