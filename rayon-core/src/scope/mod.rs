@@ -723,12 +723,12 @@ impl ScopeLatch {
                 latch,
                 registry,
                 worker_index,
-            } => unsafe {
+            } => {
                 let owner = owner.expect("owner thread");
                 debug_assert_eq!(registry.id(), owner.registry().id());
                 debug_assert_eq!(*worker_index, owner.index());
                 owner.wait_until(latch);
-            },
+            }
             ScopeLatch::Blocking { latch } => latch.wait(),
         }
     }

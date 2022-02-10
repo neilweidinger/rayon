@@ -155,8 +155,8 @@ async fn example() -> i32 {
 
 /// TODO: docs
 /// This accepts a function that creates a future, not a future directly since we need to ensure
-/// that the future has not been polled yet (since we will be moving the future and a future that
-/// has been polled cannot be moved, since otherwise it will not fulfill its Pin requirements).
+/// that the future has not been polled yet (we will be moving the future and a future that has
+/// been polled cannot be moved, since otherwise it will not fulfill its Pin requirements).
 pub fn join_async<A, B, RA, RB>(
     create_future_a: A,
     create_future_b: B,

@@ -637,7 +637,7 @@ impl WorkerThread {
 
     /// Sets `self` as the worker thread index for the current thread.
     /// This is done during worker thread startup.
-    unsafe fn set_current(thread: *const WorkerThread) {
+    fn set_current(thread: *const WorkerThread) {
         WORKER_THREAD_STATE.with(|t| {
             assert!(t.get().is_null());
             t.set(thread);
@@ -662,7 +662,7 @@ impl WorkerThread {
     }
 
     #[inline]
-    pub(super) unsafe fn push(&self, job: JobRef) {
+    pub(super) fn push(&self, job: JobRef) {
         self.log(|| JobPushed { worker: self.index });
         let queue_was_empty = self.worker.is_empty();
         self.worker.push(job);
@@ -686,7 +686,7 @@ impl WorkerThread {
     /// for breadth-first execution, it would mean dequeuing from the
     /// bottom.
     #[inline]
-    pub(super) unsafe fn take_local_job(&self) -> Option<JobRef> {
+    pub(super) fn take_local_job(&self) -> Option<JobRef> {
         let popped_job = self.worker.pop();
 
         if popped_job.is_some() {
@@ -699,7 +699,7 @@ impl WorkerThread {
     /// Wait until the latch is set. Try to keep busy by popping and
     /// stealing tasks as necessary.
     #[inline]
-    pub(super) unsafe fn wait_until<L: AsCoreLatch + ?Sized>(&self, latch: &L) {
+    pub(super) fn wait_until<L: AsCoreLatch + ?Sized>(&self, latch: &L) {
         let latch = latch.as_core_latch();
         if !latch.probe() {
             self.wait_until_cold(latch);
@@ -707,7 +707,7 @@ impl WorkerThread {
     }
 
     #[cold]
-    unsafe fn wait_until_cold(&self, latch: &CoreLatch) {
+    fn wait_until_cold(&self, latch: &CoreLatch) {
         // the code below should swallow all panics and hence never
         // unwind; but if something does wrong, we want to abort,
         // because otherwise other code in rayon may assume that the
@@ -738,7 +738,11 @@ impl WorkerThread {
 
             if let Some(job) = job {
                 self.registry.sleep.work_found(idle_state);
-                self.execute(job, injected);
+
+                unsafe {
+                    self.execute(job, injected);
+                }
+
                 idle_state = self.registry.sleep.start_looking(self.index, latch);
             } else {
                 self.registry
@@ -768,7 +772,7 @@ impl WorkerThread {
     ///
     /// This should only be done as a last resort, when there is no
     /// local work to do.
-    unsafe fn steal(&self) -> Option<JobRef> {
+    fn steal(&self) -> Option<JobRef> {
         // we only steal when we don't have any work to do locally
         debug_assert!(self.local_deque_is_empty());
 
