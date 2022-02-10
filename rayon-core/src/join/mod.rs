@@ -155,8 +155,8 @@ async fn example() -> i32 {
 
 /// TODO: docs
 pub fn join_async<A, B, RA, RB>(
-    oper_a: A,
-    oper_b: B,
+    create_future_a: A,
+    create_future_b: B,
 ) -> (<RA as Future>::Output, <RB as Future>::Output)
 where
     A: FnOnce() -> RA + Send,
@@ -167,17 +167,20 @@ where
     <RB as Future>::Output: Send,
 {
     #[inline]
-    fn call<R>(f: impl FnOnce() -> R) -> impl FnOnce(FnContext) -> R {
+    fn context_wrapper<R>(f: impl FnOnce() -> R) -> impl FnOnce(FnContext) -> R {
         move |_| f()
     }
 
-    join_context_async(call(oper_a), call(oper_b))
+    join_context_async(
+        context_wrapper(create_future_a),
+        context_wrapper(create_future_b),
+    )
 }
 
 /// TODO: docs
 pub fn join_context_async<A, B, RA, RB>(
-    oper_a: A,
-    oper_b: B,
+    create_future_a: A,
+    create_future_b: B,
 ) -> (<RA as Future>::Output, <RB as Future>::Output)
 where
     A: FnOnce(FnContext) -> RA + Send,
@@ -187,22 +190,17 @@ where
     <RA as Future>::Output: Send,
     <RB as Future>::Output: Send,
 {
-    #[inline]
-    fn call<R>(f: impl FnOnce(FnContext) -> R) -> impl FnOnce(bool) -> R {
-        move |migrated| f(FnContext::new(migrated))
-    }
-
     registry::in_worker(|worker_thread, injected| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
-        // Future gets moved into job and lives there.
-        let future_b = call(oper_b)(injected);
+        // Future gets moved into above mentioned job and lives there.
+        let future_b = create_future_b(FnContext::new(injected));
         let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread), injected);
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up
-        // Future gets moved into job and lives there.
-        let future_a = call(oper_a)(injected);
+        // Future gets moved into above mentioned job and lives there.
+        let future_a = create_future_a(FnContext::new(injected));
         let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread), injected);
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
