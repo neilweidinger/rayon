@@ -154,6 +154,9 @@ async fn example() -> i32 {
 }
 
 /// TODO: docs
+/// This accepts a function that creates a future, not a future directly since we need to ensure
+/// that the future has not been polled yet (since we will be moving the future and a future that
+/// has been polled cannot be moved, since otherwise it will not fulfill its Pin requirements).
 pub fn join_async<A, B, RA, RB>(
     create_future_a: A,
     create_future_b: B,
@@ -166,42 +169,16 @@ where
     <RA as Future>::Output: Send,
     <RB as Future>::Output: Send,
 {
-    #[inline]
-    fn context_wrapper<R>(f: impl FnOnce() -> R) -> impl FnOnce(FnContext) -> R {
-        move |_| f()
-    }
-
-    join_context_async(
-        context_wrapper(create_future_a),
-        context_wrapper(create_future_b),
-    )
-}
-
-/// TODO: docs
-pub fn join_context_async<A, B, RA, RB>(
-    create_future_a: A,
-    create_future_b: B,
-) -> (<RA as Future>::Output, <RB as Future>::Output)
-where
-    A: FnOnce(FnContext) -> RA + Send,
-    B: FnOnce(FnContext) -> RB + Send,
-    RA: Future,
-    RB: Future,
-    <RA as Future>::Output: Send,
-    <RB as Future>::Output: Send,
-{
-    registry::in_worker(|worker_thread, injected| unsafe {
+    registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let future_b = create_future_b(FnContext::new(injected));
-        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread), injected);
+        let job_b = TaskJob::new(create_future_b(), SpinLatch::new(worker_thread));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up
         // Future gets moved into above mentioned job and lives there.
-        let future_a = create_future_a(FnContext::new(injected));
-        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread), injected);
+        let job_a = TaskJob::new(create_future_a(), SpinLatch::new(worker_thread));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 

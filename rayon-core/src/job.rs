@@ -200,7 +200,6 @@ where
     pub(super) latch: L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
-    injected: bool,
 }
 
 impl<L, F> TaskJob<L, F>
@@ -208,12 +207,11 @@ where
     L: Latch + Sync,
     F: Future,
 {
-    pub(super) fn new(future: F, latch: L, injected: bool) -> Self {
+    pub(super) fn new(future: F, latch: L) -> Self {
         Self {
             latch,
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
-            injected,
         }
     }
 
