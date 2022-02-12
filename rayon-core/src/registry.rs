@@ -738,11 +738,9 @@ impl WorkerThread {
 
             if let Some(job) = job {
                 self.registry.sleep.work_found(idle_state);
-
                 unsafe {
                     self.execute(job, injected);
                 }
-
                 idle_state = self.registry.sleep.start_looking(self.index, latch);
             } else {
                 self.registry

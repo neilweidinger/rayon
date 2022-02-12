@@ -247,19 +247,28 @@ where
         let this = &*this;
         let abort = unwind::AbortIfPanic;
 
-        // should probably wrap poll in halt_unwinding
-        match Future::poll(
-            Pin::new_unchecked(&mut *this.future.get()),
-            &mut Context::from_waker(&dummy_waker()),
-        ) {
-            Poll::Ready(x) => {
-                *(this.result.get()) = JobResult::Ok(x);
+        let execute_poll = || {
+            match Pin::new_unchecked(&mut *this.future.get())
+                .poll(&mut Context::from_waker(&dummy_waker()))
+            {
+                Poll::Ready(x) => {
+                    *(this.result.get()) = JobResult::Ok(x);
+                    this.latch.set();
+                }
+                Poll::Pending => {
+                    // pretty sure this is where we want to do 'if f is not ready' block in paper
+                    unreachable!();
+                }
+            }
+        };
+
+        match unwind::halt_unwinding(execute_poll) {
+            Err(panic) => {
+                *(this.result.get()) = JobResult::Panic(panic);
                 this.latch.set();
             }
-            Poll::Pending => {
-                // pretty sure this is where we want to do 'if f is not ready' block in paper
-            }
-        }
+            _ => (),
+        };
 
         mem::forget(abort);
     }

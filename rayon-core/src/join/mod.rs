@@ -103,7 +103,8 @@ where
         move |_| f()
     }
 
-    join_context(call(oper_a), call(oper_b))
+    // join_context(call(oper_a), call(oper_b)) // TODO: change this back
+    join_async(async { oper_a() }, async { oper_b() })
 }
 
 /// Identical to `join`, except that the closures have a parameter
@@ -145,40 +146,24 @@ where
     })
 }
 
-async fn example() -> i32 {
-    // do compute bound work
-    // .await something (IO bound), would otherwise be blocking
-    // do more compute bound work
-
-    7 // return final value
-}
-
 /// TODO: docs
-/// This accepts a function that creates a future, not a future directly since we need to ensure
-/// that the future has not been polled yet (we will be moving the future and a future that has
-/// been polled cannot be moved, since otherwise it will not fulfill its Pin requirements).
-pub fn join_async<A, B, RA, RB>(
-    create_future_a: A,
-    create_future_b: B,
-) -> (<RA as Future>::Output, <RB as Future>::Output)
+pub fn join_async<A, B>(future_a: A, future_b: B) -> (<A as Future>::Output, <B as Future>::Output)
 where
-    A: FnOnce() -> RA + Send,
-    B: FnOnce() -> RB + Send,
-    RA: Future,
-    RB: Future,
-    <RA as Future>::Output: Send,
-    <RB as Future>::Output: Send,
+    A: Future + Send,
+    B: Future + Send,
+    <A as Future>::Output: Send,
+    <B as Future>::Output: Send,
 {
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_b = TaskJob::new(create_future_b(), SpinLatch::new(worker_thread));
+        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
-        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up
+        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_a = TaskJob::new(create_future_a(), SpinLatch::new(worker_thread));
+        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
