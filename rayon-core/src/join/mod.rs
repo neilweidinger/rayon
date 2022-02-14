@@ -157,13 +157,13 @@ where
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread));
+        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread), worker_thread);
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread));
+        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread), worker_thread);
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 

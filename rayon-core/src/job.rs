@@ -1,4 +1,5 @@
 use crate::latch::Latch;
+use crate::registry::WorkerThread;
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
@@ -192,7 +193,7 @@ impl<T> JobResult<T> {
 }
 
 // Represents top level task
-pub(super) struct TaskJob<L, F>
+pub(super) struct TaskJob<'a, L, F>
 where
     L: Latch + Sync,
     F: Future,
@@ -200,18 +201,21 @@ where
     pub(super) latch: L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
+    worker_thread: &'a WorkerThread,
+    // suspended_deque: &'b  // need to use some kind of reference, channel, segmented vector, or something
 }
 
-impl<L, F> TaskJob<L, F>
+impl<'a, L, F> TaskJob<'a, L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    pub(super) fn new(future: F, latch: L) -> Self {
+    pub(super) fn new(future: F, latch: L, worker_thread: &'a WorkerThread) -> Self {
         Self {
             latch,
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
+            worker_thread,
         }
     }
 
@@ -238,7 +242,7 @@ fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(raw_dummy_waker()) }
 }
 
-impl<L, F> Job for TaskJob<L, F>
+impl<'a, L, F> Job for TaskJob<'a, L, F>
 where
     L: Latch + Sync,
     F: Future,
@@ -247,18 +251,15 @@ where
         let this = &*this;
         let abort = unwind::AbortIfPanic;
 
-        let execute_poll = || {
-            match Pin::new_unchecked(&mut *this.future.get())
-                .poll(&mut Context::from_waker(&dummy_waker()))
-            {
-                Poll::Ready(x) => {
-                    *(this.result.get()) = JobResult::Ok(x);
-                    this.latch.set();
-                }
-                Poll::Pending => {
-                    // pretty sure this is where we want to do 'if f is not ready' block in paper
-                    unreachable!();
-                }
+        let execute_poll = || match Pin::new_unchecked(&mut *this.future.get())
+            .poll(&mut Context::from_waker(&dummy_waker()))
+        {
+            Poll::Ready(x) => {
+                *(this.result.get()) = JobResult::Ok(x);
+                this.latch.set();
+            }
+            Poll::Pending => {
+                this.worker_thread.suspend_deque();
             }
         };
 
@@ -267,7 +268,7 @@ where
                 *(this.result.get()) = JobResult::Panic(panic);
                 this.latch.set();
             }
-            _ => (),
+            _ => {}
         };
 
         mem::forget(abort);
