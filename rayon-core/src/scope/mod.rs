@@ -306,7 +306,8 @@ where
     R: Send,
 {
     in_worker(|owner_thread, _| {
-        let scope = Scope::<'scope>::new(Some(owner_thread), None);
+        let opt = Some((owner_thread.registry(), owner_thread.index()));
+        let scope = Scope::<'scope>::new(opt, None);
         scope.base.complete(Some(owner_thread), || op(&scope))
     })
 }
@@ -397,7 +398,8 @@ where
     R: Send,
 {
     in_worker(|owner_thread, _| {
-        let scope = ScopeFifo::<'scope>::new(Some(owner_thread), None);
+        let opt = Some((owner_thread.registry(), owner_thread.index()));
+        let scope = ScopeFifo::<'scope>::new(opt, None);
         scope.base.complete(Some(owner_thread), || op(&scope))
     })
 }
@@ -434,8 +436,11 @@ pub(crate) fn do_in_place_scope<'scope, OP, R>(registry: Option<&Arc<Registry>>,
 where
     OP: FnOnce(&Scope<'scope>) -> R,
 {
-    let thread = unsafe { WorkerThread::current().as_ref() };
-    let scope = Scope::<'scope>::new(thread, registry);
+    let thread = unsafe { WorkerThread::current().as_mut() };
+    let opt = thread
+        .as_ref()
+        .map(|thread| (thread.registry(), thread.index()));
+    let scope = Scope::<'scope>::new(opt, registry);
     scope.base.complete(thread, || op(&scope))
 }
 
@@ -471,13 +476,16 @@ pub(crate) fn do_in_place_scope_fifo<'scope, OP, R>(registry: Option<&Arc<Regist
 where
     OP: FnOnce(&ScopeFifo<'scope>) -> R,
 {
-    let thread = unsafe { WorkerThread::current().as_ref() };
-    let scope = ScopeFifo::<'scope>::new(thread, registry);
+    let thread = unsafe { WorkerThread::current().as_mut() };
+    let opt = thread
+        .as_ref()
+        .map(|thread| (thread.registry(), thread.index()));
+    let scope = ScopeFifo::<'scope>::new(opt, registry);
     scope.base.complete(thread, || op(&scope))
 }
 
 impl<'scope> Scope<'scope> {
-    fn new(owner: Option<&WorkerThread>, registry: Option<&Arc<Registry>>) -> Self {
+    fn new(owner: Option<(&Arc<Registry>, usize)>, registry: Option<&Arc<Registry>>) -> Self {
         let base = ScopeBase::new(owner, registry);
         Scope { base }
     }
@@ -554,7 +562,7 @@ impl<'scope> Scope<'scope> {
 }
 
 impl<'scope> ScopeFifo<'scope> {
-    fn new(owner: Option<&WorkerThread>, registry: Option<&Arc<Registry>>) -> Self {
+    fn new(owner: Option<(&Arc<Registry>, usize)>, registry: Option<&Arc<Registry>>) -> Self {
         let base = ScopeBase::new(owner, registry);
         let num_threads = base.registry.num_threads();
         let fifos = (0..num_threads).map(|_| JobFifo::new()).collect();
@@ -601,9 +609,9 @@ impl<'scope> ScopeFifo<'scope> {
 
 impl<'scope> ScopeBase<'scope> {
     /// Creates the base of a new scope for the given registry
-    fn new(owner: Option<&WorkerThread>, registry: Option<&Arc<Registry>>) -> Self {
+    fn new(owner: Option<(&Arc<Registry>, usize)>, registry: Option<&Arc<Registry>>) -> Self {
         let registry = registry.unwrap_or_else(|| match owner {
-            Some(owner) => owner.registry(),
+            Some((owner_registry, _)) => owner_registry,
             None => global_registry(),
         });
 
@@ -621,7 +629,7 @@ impl<'scope> ScopeBase<'scope> {
 
     /// Executes `func` as a job, either aborting or executing as
     /// appropriate.
-    fn complete<FUNC, R>(&self, owner: Option<&WorkerThread>, func: FUNC) -> R
+    fn complete<FUNC, R>(&self, owner: Option<&mut WorkerThread>, func: FUNC) -> R
     where
         FUNC: FnOnce() -> R,
     {
@@ -686,12 +694,12 @@ impl<'scope> ScopeBase<'scope> {
 }
 
 impl ScopeLatch {
-    fn new(owner: Option<&WorkerThread>) -> Self {
+    fn new(owner: Option<(&Arc<Registry>, usize)>) -> Self {
         match owner {
-            Some(owner) => ScopeLatch::Stealing {
+            Some((registry, index)) => ScopeLatch::Stealing {
                 latch: CountLatch::new(),
-                registry: Arc::clone(owner.registry()),
-                worker_index: owner.index(),
+                registry: Arc::clone(registry),
+                worker_index: index,
             },
             None => ScopeLatch::Blocking {
                 latch: CountLockLatch::new(),
@@ -717,7 +725,7 @@ impl ScopeLatch {
         }
     }
 
-    fn wait(&self, owner: Option<&WorkerThread>) {
+    fn wait(&self, owner: Option<&mut WorkerThread>) {
         match self {
             ScopeLatch::Stealing {
                 latch,

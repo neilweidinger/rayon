@@ -130,11 +130,20 @@ where
         // Create virtual wrapper for task b; this all has to be
         // done here so that the stack frame can keep it all live
         // long enough.
-        let job_b = StackJob::new(call(oper_b), SpinLatch::new(worker_thread), injected);
+        let reg = worker_thread.registry().clone();
+        let job_b = StackJob::new(
+            call(oper_b),
+            SpinLatch::new(&reg, worker_thread.index()),
+            injected,
+        );
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
-        let job_a = StackJob::new(call(oper_a), SpinLatch::new(worker_thread), injected);
+        let job_a = StackJob::new(
+            call(oper_a),
+            SpinLatch::new(&reg, worker_thread.index()),
+            injected,
+        );
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
@@ -157,13 +166,14 @@ where
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread));
+        let reg = worker_thread.registry().clone();
+        let job_b = TaskJob::new(future_b, SpinLatch::new(&reg, worker_thread.index()));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread));
+        let job_a = TaskJob::new(future_a, SpinLatch::new(&reg, worker_thread.index()));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
@@ -180,7 +190,7 @@ where
 /// enclosing stack frame(s).
 #[cold] // cold path
 unsafe fn join_recover_from_panic(
-    worker_thread: &WorkerThread,
+    worker_thread: &mut WorkerThread,
     job_b_latch: &SpinLatch<'_>,
     err: Box<dyn Any + Send>,
 ) -> ! {

@@ -165,9 +165,14 @@ static THE_REGISTRY_SET: Once = Once::new();
 /// initialization has not already occurred, use the default
 /// configuration.
 pub(super) fn global_registry() -> &'static Arc<Registry> {
-    set_global_registry(|| Registry::new(ThreadPoolBuilder::new()))
-        .or_else(|err| unsafe { THE_REGISTRY.as_ref().ok_or(err) })
-        .expect("The global thread pool has not been initialized.")
+    set_global_registry(|| {
+        Registry::new(
+            ThreadPoolBuilder::new()
+                .thread_name(|thread_index| format!("Rayon worker thread {}", thread_index)),
+        )
+    })
+    .or_else(|err| unsafe { THE_REGISTRY.as_ref().ok_or(err) })
+    .expect("The global thread pool has not been initialized.")
 }
 
 /// Starts the worker threads (if that has not already happened) with
@@ -429,20 +434,20 @@ impl Registry {
     /// was performed, `false` if executed directly.
     pub(super) fn in_worker<OP, R>(&self, op: OP) -> R
     where
-        OP: FnOnce(&WorkerThread, bool) -> R + Send,
+        OP: FnOnce(&mut WorkerThread, bool) -> R + Send,
         R: Send,
     {
         unsafe {
             let worker_thread = WorkerThread::current();
             if worker_thread.is_null() {
                 self.in_worker_cold(op)
-            } else if (*worker_thread).registry().id() != self.id() {
-                self.in_worker_cross(&*worker_thread, op)
+            // } else if (*worker_thread).registry().id() != self.id() {
+            //     self.in_worker_cross(&*worker_thread, op)
             } else {
                 // Perfectly valid to give them a `&T`: this is the
                 // current thread, so we know the data structure won't be
                 // invalidated until we return.
-                op(&*worker_thread, false)
+                op(&mut *worker_thread, false)
             }
         }
     }
@@ -450,7 +455,7 @@ impl Registry {
     #[cold]
     unsafe fn in_worker_cold<OP, R>(&self, op: OP) -> R
     where
-        OP: FnOnce(&WorkerThread, bool) -> R + Send,
+        OP: FnOnce(&mut WorkerThread, bool) -> R + Send,
         R: Send,
     {
         thread_local!(static LOCK_LATCH: LockLatch = LockLatch::new());
@@ -463,9 +468,9 @@ impl Registry {
             debug_assert!(WorkerThread::current().is_null());
             let job = StackJob::new(
                 |injected| {
-                    let worker_thread = WorkerThread::current();
+                    let worker_thread: *mut WorkerThread = WorkerThread::current();
                     assert!(injected && !worker_thread.is_null());
-                    op(&*worker_thread, injected)
+                    op(&mut *worker_thread, injected)
                 },
                 l,
                 true,
@@ -481,7 +486,7 @@ impl Registry {
     }
 
     #[cold]
-    unsafe fn in_worker_cross<OP, R>(&self, current_thread: &WorkerThread, op: OP) -> R
+    unsafe fn in_worker_cross<OP, R>(&self, current_thread: &mut WorkerThread, op: OP) -> R
     where
         OP: FnOnce(&WorkerThread, bool) -> R + Send,
         R: Send,
@@ -489,7 +494,8 @@ impl Registry {
         // This thread is a member of a different pool, so let it process
         // other work while waiting for this `op` to complete.
         debug_assert!(current_thread.registry().id() != self.id());
-        let latch = SpinLatch::cross(current_thread);
+        let reg = current_thread.registry().clone();
+        let latch = SpinLatch::cross(&reg, current_thread.index());
         let job = StackJob::new(
             |injected| {
                 let worker_thread = WorkerThread::current();
@@ -576,6 +582,7 @@ struct ThreadInfo {
 
     /// the "stealer" half of the worker's deque
     stealer: Stealer<JobRef>,
+    // stealables: DashSet<Stealer<JobRef>>,
 }
 
 impl ThreadInfo {
@@ -594,7 +601,7 @@ impl ThreadInfo {
 
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
-    worker: Worker<JobRef>,
+    worker: Worker<JobRef>, // probably turn into a cell
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -613,15 +620,15 @@ pub(super) struct WorkerThread {
 // worker is fully unwound. Using an unsafe pointer avoids the need
 // for a RefCell<T> etc.
 thread_local! {
-    static WORKER_THREAD_STATE: Cell<*const WorkerThread> = Cell::new(ptr::null());
+    static WORKER_THREAD_STATE: Cell<*mut WorkerThread> = Cell::new(ptr::null::<WorkerThread>() as *mut _);
 }
 
 impl Drop for WorkerThread {
     fn drop(&mut self) {
         // Undo `set_current`
         WORKER_THREAD_STATE.with(|t| {
-            assert!(t.get().eq(&(self as *const _)));
-            t.set(ptr::null());
+            assert!(t.get().eq(&(self as *mut _)));
+            t.set(ptr::null::<WorkerThread>() as *mut _);
         });
     }
 }
@@ -631,13 +638,13 @@ impl WorkerThread {
     /// NULL if this is not a worker thread. This pointer is valid
     /// anywhere on the current thread.
     #[inline]
-    pub(super) fn current() -> *const WorkerThread {
+    pub(super) fn current() -> *mut WorkerThread {
         WORKER_THREAD_STATE.with(Cell::get)
     }
 
     /// Sets `self` as the worker thread index for the current thread.
     /// This is done during worker thread startup.
-    fn set_current(thread: *const WorkerThread) {
+    fn set_current(thread: *mut WorkerThread) {
         WORKER_THREAD_STATE.with(|t| {
             assert!(t.get().is_null());
             t.set(thread);
@@ -699,7 +706,7 @@ impl WorkerThread {
     /// Wait until the latch is set. Try to keep busy by popping and
     /// stealing tasks as necessary.
     #[inline]
-    pub(super) fn wait_until<L: AsCoreLatch + ?Sized>(&self, latch: &L) {
+    pub(super) fn wait_until<L: AsCoreLatch + ?Sized>(&mut self, latch: &L) {
         let latch = latch.as_core_latch();
         if !latch.probe() {
             self.wait_until_cold(latch);
@@ -818,14 +825,14 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
     // current thread running the main loop function, and is used in another functions to retrieve
     // the currently running thread (currently running thread stored in thread local
     // WORKER_THREAD_STATE)
-    let worker_thread = &WorkerThread {
+    let mut worker_thread = WorkerThread {
         worker,
         fifo: JobFifo::new(),
         index,
         rng: XorShift64Star::new(),
         registry: registry.clone(),
     };
-    WorkerThread::set_current(worker_thread);
+    WorkerThread::set_current(&mut worker_thread);
 
     // let registry know we are ready to do work
     registry.thread_infos[index].primed.set();
@@ -884,7 +891,7 @@ unsafe fn main_loop(worker: Worker<JobRef>, registry: Arc<Registry>, index: usiz
 /// `true` if injection was performed, `false` if executed directly.
 pub(super) fn in_worker<OP, R>(op: OP) -> R
 where
-    OP: FnOnce(&WorkerThread, bool) -> R + Send,
+    OP: FnOnce(&mut WorkerThread, bool) -> R + Send,
     R: Send,
 {
     unsafe {
@@ -893,7 +900,7 @@ where
             // Perfectly valid to give them a `&T`: this is the
             // current thread, so we know the data structure won't be
             // invalidated until we return.
-            op(&*owner_thread, false)
+            op(&mut *owner_thread, false)
         } else {
             global_registry().in_worker_cold(op) // This is where the global threadpool gets created
                                                  // when first calling something like join.
