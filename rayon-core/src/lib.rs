@@ -198,7 +198,9 @@ impl Default for ThreadPoolBuilder {
         ThreadPoolBuilder {
             num_threads: 0,
             panic_handler: None,
-            get_thread_name: None,
+            get_thread_name: Some(Box::new(|thread_index| {
+                format!("Rayon worker thread {}", thread_index)
+            })),
             stack_size: None,
             start_handler: None,
             exit_handler: None,

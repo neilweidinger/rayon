@@ -263,9 +263,11 @@ impl Registry {
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        let stealable_deques = (0..n_threads)
-            .map(|_| DashSet::<DequeId>::new())
-            .collect::<Vec<_>>(); // TODO: create set with capacity? make CachePadded?
+        let stealable_deques: Vec<_> = deques
+            .iter()
+            .map(|deque| DashSet::<DequeId>::from_iter([deque.id]))
+            .collect();
+
         let stealable_deques = Arc::new(stealable_deques);
 
         for (index, deque) in deques.into_iter().enumerate() {
@@ -619,7 +621,7 @@ enum DequeState {
     Muggable,
 }
 
-#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+#[derive(Debug, PartialEq, Eq, Hash, Clone, Copy)]
 struct DequeId(usize);
 
 // TODO: put all deque stuff into seperate module
@@ -880,13 +882,15 @@ impl WorkerThread {
                 .filter(move |&i| i != self.index)
                 .find_map(|victim_index| {
                     let victim_stealables = &self.stealable_deques[victim_index];
+
                     let random_index = match victim_stealables.len() {
                         0 => return None,
-                        len => self.rng.next_usize(len - 1), // TODO: is this inclusive or exclusive end?
+                        len => self.rng.next_usize(len),
                     };
-                    let victim_deque_id = victim_stealables
-                        .remove(&victim_stealables.iter().nth(random_index).unwrap()) // could this remove cause cache issues?
-                        .unwrap(); // TODO: verify unwraps or just remove
+
+                    // TODO: this iteration strategy of selecting a random deque is super inefficient, must change
+                    let victim_deque_id =
+                        victim_stealables.iter().nth(random_index).unwrap().clone();
 
                     let victim_deque_stealer =
                         self.registry.deque_stealers.get(&victim_deque_id).unwrap();
@@ -897,6 +901,11 @@ impl WorkerThread {
                                 worker: self.index,
                                 victim: victim_index,
                             });
+
+                            victim_stealables
+                                .remove(&victim_deque_id) // TODO: could this remove cause cache issues?
+                                .unwrap(); // TODO: verify unwraps or just remove
+
                             Some(job)
                         }
                         Steal::Empty => None,
