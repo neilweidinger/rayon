@@ -889,11 +889,17 @@ impl WorkerThread {
                     };
 
                     // TODO: this iteration strategy of selecting a random deque is super inefficient, must change
-                    let victim_deque_id =
-                        victim_stealables.iter().nth(random_index).unwrap().clone();
-
+                    // If we receive a None here, this means another thread stole and subsequently
+                    // removed this victim deque before we did, and we must retry
+                    // TODO: see if retrying impacts scheduling algorithm analysis, e.g. do we keep
+                    // trying to steal from same victim thread or should we move on to another
+                    // victim?
+                    // TODO: random index selection based on stealable set size and deque id
+                    // retrieval based on random index are not atomic, see if this actually matters
+                    // in practice
+                    let victim_deque_id = victim_stealables.iter().nth(random_index)?.clone();
                     let victim_deque_stealer =
-                        self.registry.deque_stealers.get(&victim_deque_id).unwrap();
+                        self.registry.deque_stealers.get(&victim_deque_id)?;
 
                     match victim_deque_stealer.steal() {
                         Steal::Success(job) => {
@@ -902,9 +908,14 @@ impl WorkerThread {
                                 victim: victim_index,
                             });
 
-                            victim_stealables
-                                .remove(&victim_deque_id) // TODO: could this remove cause cache issues?
-                                .unwrap(); // TODO: verify unwraps or just remove
+                            // TODO: comment this out for now, no need to remove from stealable set
+                            // yet while we still have not implemented deck switching
+                            // TODO: we also need to ensure that the steal operation and this
+                            // removal from the victim_stealables set are performed atomically (or
+                            // look into scheduling algorithm analysis to see if this even matters)
+                            // victim_stealables
+                            //     .remove(&victim_deque_id) // TODO: could this remove cause cache issues?
+                            //     .unwrap(); // TODO: verify unwraps or just remove
 
                             Some(job)
                         }
