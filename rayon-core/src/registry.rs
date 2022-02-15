@@ -9,19 +9,20 @@ use crate::{
 };
 use crossbeam_deque::Worker as CrossbeamWorker;
 use crossbeam_deque::{Injector, Steal, Stealer};
-use dashmap::DashSet;
+use dashmap::{DashMap, DashSet};
 use std::any::Any;
 use std::cell::{Cell, UnsafeCell};
 use std::collections::hash_map::DefaultHasher;
 use std::fmt;
 use std::hash::{Hash, Hasher};
 use std::io;
+use std::iter::FromIterator;
 use std::mem;
 use std::ops::{Deref, DerefMut};
 use std::ptr;
 #[allow(deprecated)]
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
 use std::thread;
 use std::usize;
 
@@ -30,10 +31,10 @@ use std::usize;
 pub struct ThreadBuilder {
     name: Option<String>,
     stack_size: Option<usize>,
-    worker: Deque<JobRef>,
+    active_deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    deque_sets: Arc<Vec<DequeSet>>,
+    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
 }
 
 impl ThreadBuilder {
@@ -55,7 +56,14 @@ impl ThreadBuilder {
     /// Executes the main loop for this thread. This will not return until the
     /// thread pool is dropped.
     pub fn run(self) {
-        unsafe { main_loop(self.worker, self.registry, self.index, self.deque_sets) }
+        unsafe {
+            main_loop(
+                self.active_deque,
+                self.registry,
+                self.index,
+                self.stealable_deques,
+            )
+        }
     }
 }
 
@@ -141,7 +149,9 @@ pub(super) struct Registry {
     panic_handler: Option<Box<PanicHandler>>,
     start_handler: Option<Box<StartHandler>>,
     exit_handler: Option<Box<ExitHandler>>,
-    deque_id: AtomicUsize, // TODO: come up with better ID generation/handling
+    deque_bench: DashSet<Deque>,
+    deque_stealers: DashMap<DequeId, Stealer<JobRef>>,
+    next_deque_id: AtomicUsize, // TODO: come up with better ID generation/handling
 
     // When this latch reaches 0, it means that all work on this
     // registry must be complete. This is ensured in the following ways:
@@ -222,46 +232,50 @@ impl Registry {
         let breadth_first = builder.get_breadth_first();
         let deque_id = AtomicUsize::new(0);
 
-        let (workers, stealers): (Vec<_>, Vec<_>) = (0..n_threads)
+        let deques: Vec<_> = (0..n_threads)
             .map(|_| {
-                let worker = if breadth_first {
-                    Deque::new_fifo(deque_id.fetch_add(1, Ordering::Relaxed))
+                if breadth_first {
+                    Deque::new_fifo(DequeId(deque_id.fetch_add(1, Ordering::Relaxed)))
                 } else {
-                    Deque::new_lifo(deque_id.fetch_add(1, Ordering::Relaxed))
-                };
-
-                let stealer = worker.stealer();
-                (worker, stealer)
+                    Deque::new_lifo(DequeId(deque_id.fetch_add(1, Ordering::Relaxed)))
+                }
             })
-            .unzip();
+            .collect();
 
+        let deque_stealers =
+            DashMap::from_iter(deques.iter().map(|deque| (deque.id, deque.stealer()))); // TODO: create with capacity? CachePadded??
         let logger = Logger::new(n_threads);
+
         let registry = Arc::new(Registry {
             logger: logger.clone(),
-            thread_infos: stealers.into_iter().map(ThreadInfo::new).collect(),
+            thread_infos: (0..n_threads).map(|_| ThreadInfo::new()).collect(),
             sleep: Sleep::new(logger, n_threads),
             injected_jobs: Injector::new(),
             terminate_count: AtomicUsize::new(1),
             panic_handler: builder.take_panic_handler(),
             start_handler: builder.take_start_handler(),
             exit_handler: builder.take_exit_handler(),
-            deque_id,
+            deque_bench: DashSet::<Deque>::new(), // TODO: make CachePadded?
+            deque_stealers,
+            next_deque_id: deque_id,
         });
 
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        let deque_sets: Vec<_> = (0..n_threads).map(|_| DequeSet::default()).collect(); // TODO: make CachePadded?
-        let deque_sets = Arc::new(deque_sets);
+        let stealable_deques = (0..n_threads)
+            .map(|_| DashSet::<DequeId>::new())
+            .collect::<Vec<_>>(); // TODO: create set with capacity? make CachePadded?
+        let stealable_deques = Arc::new(stealable_deques);
 
-        for (index, worker) in workers.into_iter().enumerate() {
+        for (index, deque) in deques.into_iter().enumerate() {
             let thread = ThreadBuilder {
                 name: builder.get_thread_name(index),
                 stack_size: builder.get_stack_size(),
                 registry: registry.clone(),
-                worker,
+                active_deque: deque,
                 index,
-                deque_sets: deque_sets.clone(),
+                stealable_deques: stealable_deques.clone(),
             };
             if let Err(e) = builder.get_spawn_handler().spawn(thread) {
                 return Err(ThreadPoolBuildError::new(ErrorKind::IOError(e)));
@@ -583,18 +597,14 @@ struct ThreadInfo {
     /// NB. We use a `CountLatch` here because it has no lifetimes and is
     /// meant for async use, but the count never gets higher than one.
     terminate: CountLatch,
-
-    /// the "stealer" half of the worker's deque
-    active_stealer: Stealer<JobRef>,
 }
 
 impl ThreadInfo {
-    fn new(stealer: Stealer<JobRef>) -> ThreadInfo {
+    fn new() -> ThreadInfo {
         ThreadInfo {
             primed: LockLatch::new(),
             stopped: LockLatch::new(),
             terminate: CountLatch::new(),
-            active_stealer: stealer,
         }
     }
 }
@@ -609,15 +619,18 @@ enum DequeState {
     Muggable,
 }
 
+#[derive(PartialEq, Eq, Hash, Clone, Copy)]
+struct DequeId(usize);
+
 // TODO: put all deque stuff into seperate module
-struct Deque<T> {
-    deque: CrossbeamWorker<T>,
-    id: usize,
+struct Deque {
+    deque: CrossbeamWorker<JobRef>,
+    id: DequeId,
     state: DequeState,
 }
 
-impl<T> Deque<T> {
-    fn new_fifo(id: usize) -> Self {
+impl Deque {
+    fn new_fifo(id: DequeId) -> Self {
         Self {
             deque: CrossbeamWorker::new_fifo(),
             id,
@@ -625,7 +638,7 @@ impl<T> Deque<T> {
         }
     }
 
-    fn new_lifo(id: usize) -> Self {
+    fn new_lifo(id: DequeId) -> Self {
         Self {
             deque: CrossbeamWorker::new_lifo(),
             id,
@@ -634,81 +647,42 @@ impl<T> Deque<T> {
     }
 }
 
-impl<T> PartialEq for Deque<T> {
+impl PartialEq for Deque {
     fn eq(&self, other: &Self) -> bool {
         self.id == other.id
     }
 }
 
-impl<T> Eq for Deque<T> {}
+impl Eq for Deque {}
 
-impl<T> Hash for Deque<T> {
+impl Hash for Deque {
     fn hash<H: Hasher>(&self, state: &mut H) {
         self.id.hash(state);
     }
 }
 
-impl<T> Deref for Deque<T> {
-    type Target = CrossbeamWorker<T>;
+// TODO: keep Deref impls?
+impl Deref for Deque {
+    type Target = CrossbeamWorker<JobRef>;
 
     fn deref(&self) -> &Self::Target {
         &self.deque
     }
 }
 
-impl<T> DerefMut for Deque<T> {
+impl DerefMut for Deque {
     fn deref_mut(&mut self) -> &mut Self::Target {
         &mut self.deque
     }
 }
 
-// TODO: make default create with capacity?
-#[derive(Default)]
-struct DequeSet {
-    stealables: DashSet<ProtectedWorker>,
-    bench: DashSet<ProtectedWorker>,
-}
-
-struct ProtectedWorker(Mutex<Deque<JobRef>>);
-
-impl ProtectedWorker {
-    fn with_worker(deque: Deque<JobRef>) -> Self {
-        Self(Mutex::new(deque))
-    }
-}
-
-impl PartialEq for ProtectedWorker {
-    fn eq(&self, other: &Self) -> bool {
-        self == other
-    }
-}
-
-impl Eq for ProtectedWorker {}
-
-impl Hash for ProtectedWorker {
-    fn hash<H: Hasher>(&self, state: &mut H) {
-        std::ptr::hash(self, state)
-    }
-}
-
-impl Deref for ProtectedWorker {
-    type Target = Mutex<Deque<JobRef>>;
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-impl DerefMut for ProtectedWorker {
-    fn deref_mut(&mut self) -> &mut Self::Target {
-        &mut self.0
-    }
-}
+// TODO: absolutely need to make sure this is safe
+unsafe impl Sync for Deque {}
 
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
-    active_deque: UnsafeCell<Option<Deque<JobRef>>>,
-    deque_sets: Arc<Vec<DequeSet>>,
+    active_deque: UnsafeCell<Option<Deque>>,
+    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -905,8 +879,19 @@ impl WorkerThread {
                 .chain(0..start)
                 .filter(move |&i| i != self.index)
                 .find_map(|victim_index| {
-                    let victim = &thread_infos[victim_index];
-                    match victim.active_stealer.steal() {
+                    let victim_stealables = &self.stealable_deques[victim_index];
+                    let random_index = match victim_stealables.len() {
+                        0 => return None,
+                        len => self.rng.next_usize(len - 1), // TODO: is this inclusive or exclusive end?
+                    };
+                    let victim_deque_id = victim_stealables
+                        .remove(&victim_stealables.iter().nth(random_index).unwrap()) // could this remove cause cache issues?
+                        .unwrap(); // TODO: verify unwraps or just remove
+
+                    let victim_deque_stealer =
+                        self.registry.deque_stealers.get(&victim_deque_id).unwrap();
+
+                    match victim_deque_stealer.steal() {
                         Steal::Success(job) => {
                             self.log(|| JobStolen {
                                 worker: self.index,
@@ -921,6 +906,7 @@ impl WorkerThread {
                         }
                     }
                 });
+
             if job.is_some() || !retry {
                 return job;
             }
@@ -933,9 +919,7 @@ impl WorkerThread {
 
         if !active_deque.is_empty() {
             let random_index = 0;
-            self.deque_sets[random_index]
-                .stealables
-                .insert(ProtectedWorker::with_worker(active_deque));
+            self.stealable_deques[random_index].insert(active_deque.id);
         }
     }
 }
@@ -943,22 +927,22 @@ impl WorkerThread {
 /// ////////////////////////////////////////////////////////////////////////
 
 unsafe fn main_loop(
-    worker: Deque<JobRef>,
+    deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    deque_sets: Arc<Vec<DequeSet>>,
+    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
 ) {
     // this is the only time a WorkerThread is created: this struct represents the state for the
     // current thread running the main loop function, and is used in another functions to retrieve
     // the currently running thread (currently running thread stored in thread local
     // WORKER_THREAD_STATE)
     let worker_thread = &WorkerThread {
-        active_deque: UnsafeCell::new(Some(worker)),
+        active_deque: UnsafeCell::new(Some(deque)),
         fifo: JobFifo::new(),
         index,
         rng: XorShift64Star::new(),
         registry: registry.clone(),
-        deque_sets,
+        stealable_deques,
     };
     WorkerThread::set_current(worker_thread);
 
