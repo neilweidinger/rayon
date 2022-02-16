@@ -1,4 +1,4 @@
-use crate::job::{JobFifo, JobRef, StackJob};
+use crate::job::{ExecutionContext, JobFifo, JobRef, StackJob};
 use crate::latch::{AsCoreLatch, CoreLatch, CountLatch, Latch, LockLatch, SpinLatch};
 use crate::log::Event::*;
 use crate::log::Logger;
@@ -45,7 +45,7 @@ impl ThreadBuilder {
 
     /// Gets the string that was specified by `ThreadPoolBuilder::name()`.
     pub fn name(&self) -> Option<&str> {
-        self.name.as_ref().map(String::as_str)
+        self.name.as_deref()
     }
 
     /// Gets the value that was specified by `ThreadPoolBuilder::stack_size()`.
@@ -260,15 +260,19 @@ impl Registry {
             next_deque_id: deque_id,
         });
 
-        // If we return early or panic, make sure to terminate existing threads.
-        let t1000 = Terminator(&registry);
-
         let stealable_deques = Arc::new(
+            // TODO: make CachePadded??
             deques
                 .iter()
-                .map(|deque| IntoIterator::into_iter([deque.id]).collect::<StealableSet>())
+                .map(|deque| {
+                    IntoIterator::into_iter([(deque.id, DequeState::Active)])
+                        .collect::<StealableSet>()
+                })
                 .collect::<Vec<_>>(),
         );
+
+        // If we return early or panic, make sure to terminate existing threads.
+        let t1000 = Terminator(&registry);
 
         for (index, deque) in deques.into_iter().enumerate() {
             let thread = ThreadBuilder {
@@ -279,6 +283,7 @@ impl Registry {
                 index,
                 stealable_deques: stealable_deques.clone(),
             };
+
             if let Err(e) = builder.get_spawn_handler().spawn(thread) {
                 return Err(ThreadPoolBuildError::new(ErrorKind::IOError(e)));
             }
@@ -494,7 +499,7 @@ impl Registry {
                     op(&*worker_thread, injected)
                 },
                 l,
-                true,
+                None,
             );
             self.inject(&[job.as_job_ref()]);
             job.latch.wait_and_reset(); // Make sure we can use the same latch again next time.
@@ -523,7 +528,7 @@ impl Registry {
                 op(&*worker_thread, injected)
             },
             latch,
-            true,
+            None,
         );
         self.inject(&[job.as_job_ref()]);
         current_thread.wait_until(&job.latch);
@@ -628,23 +633,22 @@ struct DequeId(usize);
 struct Deque {
     deque: CrossbeamWorker<JobRef>,
     id: DequeId,
-    state: DequeState,
 }
 
 impl Deque {
+    #[must_use]
     fn new_fifo(id: DequeId) -> Self {
         Self {
             deque: CrossbeamWorker::new_fifo(),
             id,
-            state: DequeState::Active,
         }
     }
 
+    #[must_use]
     fn new_lifo(id: DequeId) -> Self {
         Self {
             deque: CrossbeamWorker::new_lifo(),
             id,
-            state: DequeState::Active,
         }
     }
 }
@@ -682,21 +686,20 @@ impl DerefMut for Deque {
 unsafe impl Sync for Deque {}
 
 struct StealableSet {
-    stealable_deque_ids: Mutex<(Vec<DequeId>, XorShift64Star)>,
+    stealable_deque_ids: Mutex<(Vec<(DequeId, DequeState)>, XorShift64Star)>,
 }
 
 impl StealableSet {
+    #[must_use]
     fn get_random_deque_id(&self) -> DequeId {
-        let guard = self.stealable_deque_ids.lock().unwrap();
-        let (ref v, ref rng) = *guard;
+        let (v, rng) = &*self.stealable_deque_ids.lock().unwrap();
         let random_index = rng.next_usize(v.len());
-
-        v[random_index]
+        v[random_index].0
     }
 }
 
-impl FromIterator<DequeId> for StealableSet {
-    fn from_iter<I: IntoIterator<Item = DequeId>>(iter: I) -> Self {
+impl FromIterator<(DequeId, DequeState)> for StealableSet {
+    fn from_iter<I: IntoIterator<Item = (DequeId, DequeState)>>(iter: I) -> Self {
         Self {
             stealable_deque_ids: Mutex::new((iter.into_iter().collect(), XorShift64Star::new())),
         }
@@ -711,7 +714,7 @@ pub(super) struct WorkerThread {
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
 
-    index: usize,
+    pub(super) index: usize,
 
     /// A weak random number generator.
     rng: XorShift64Star,
@@ -854,7 +857,7 @@ impl WorkerThread {
             if let Some(job) = job {
                 self.registry.sleep.work_found(idle_state);
                 unsafe {
-                    self.execute(job, injected);
+                    self.execute(job);
                 }
                 idle_state = self.registry.sleep.start_looking(self.index, latch);
             } else {
@@ -877,8 +880,8 @@ impl WorkerThread {
     }
 
     #[inline]
-    pub(super) unsafe fn execute(&self, job: JobRef, injected: bool) {
-        job.execute(injected);
+    pub(super) unsafe fn execute(&self, job: JobRef) {
+        job.execute(ExecutionContext::new(self));
     }
 
     /// Try to steal a single job and return it.

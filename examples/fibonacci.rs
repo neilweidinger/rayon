@@ -1,4 +1,5 @@
 trait Joiner {
+    #[must_use]
     fn is_parallel() -> bool;
 
     fn join<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
@@ -12,6 +13,7 @@ trait Joiner {
 struct Serial;
 
 impl Joiner for Serial {
+    #[must_use]
     fn is_parallel() -> bool {
         false
     }
@@ -33,6 +35,7 @@ impl Joiner for Serial {
 struct Parallel;
 
 impl Joiner for Parallel {
+    #[must_use]
     fn is_parallel() -> bool {
         true
     }
@@ -48,6 +51,7 @@ impl Joiner for Parallel {
     }
 }
 
+#[must_use]
 fn fib<J: Joiner>(n: u32) -> (u32, u32) {
     if n <= 1 {
         return (n, 1);

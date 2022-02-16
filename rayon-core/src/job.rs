@@ -5,6 +5,7 @@ use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::future::Future;
+use std::marker::PhantomData;
 use std::mem;
 use std::pin::Pin;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
@@ -13,6 +14,21 @@ pub(super) enum JobResult<T> {
     None,
     Ok(T),
     Panic(Box<dyn Any + Send>),
+}
+
+pub(super) struct ExecutionContext<'a> {
+    worker_thread: &'a WorkerThread,
+    /// disable `Send` and `Sync`, just for a little future-proofing.
+    _marker: PhantomData<*mut ()>,
+}
+
+impl<'a> ExecutionContext<'a> {
+    pub(super) fn new(worker_thread: &'a WorkerThread) -> Self {
+        Self {
+            worker_thread,
+            _marker: PhantomData,
+        }
+    }
 }
 
 /// A `Job` is used to advertise work for other threads that they may
@@ -24,7 +40,7 @@ pub(super) trait Job {
     /// Unsafe: this may be called from a different thread than the one
     /// which scheduled the job, so the implementer must ensure the
     /// appropriate traits are met, whether `Send`, `Sync`, or both.
-    unsafe fn execute(this: *const Self, injected: bool);
+    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>);
 }
 
 /// Effectively a Job trait object. Each JobRef **must** be executed
@@ -33,10 +49,10 @@ pub(super) trait Job {
 /// Internally, we store the job's data in a `*const ()` pointer.  The
 /// true type is something like `*const StackJob<...>`, but we hide
 /// it. We also carry the "execute fn" from the `Job` trait.
-#[derive(Copy, Clone, Debug, PartialEq, Eq)]
+#[derive(Copy, Clone)]
 pub(super) struct JobRef {
     pointer: *const (),
-    execute_fn: unsafe fn(*const (), bool),
+    execute_fn: for<'a> unsafe fn(*const (), ExecutionContext<'a>),
 }
 
 unsafe impl Send for JobRef {}
@@ -49,7 +65,7 @@ impl JobRef {
     where
         T: Job,
     {
-        let fn_ptr: unsafe fn(*const T, bool) = <T as Job>::execute;
+        let fn_ptr: for<'a> unsafe fn(*const T, ExecutionContext<'a>) = <T as Job>::execute;
 
         // erase types:
         JobRef {
@@ -59,8 +75,8 @@ impl JobRef {
     }
 
     #[inline]
-    pub(super) unsafe fn execute(&self, injected: bool) {
-        (self.execute_fn)(self.pointer, injected)
+    pub(super) unsafe fn execute<'a>(&self, context: ExecutionContext<'a>) {
+        (self.execute_fn)(self.pointer, context)
     }
 }
 
@@ -71,13 +87,13 @@ impl JobRef {
 pub(super) struct StackJob<L, F, R>
 where
     L: Latch + Sync,
-    F: FnOnce(bool) -> R + Send,
+    F: FnOnce(bool) -> R + Send, // TODO: refactor to use ExecutionContext
     R: Send,
 {
     pub(super) latch: L,
     func: UnsafeCell<Option<F>>,
     result: UnsafeCell<JobResult<R>>,
-    injected: bool,
+    worker_thread_index: Option<usize>, // the worker thread index on which this job was created, None if this job was injected
 }
 
 impl<L, F, R> StackJob<L, F, R>
@@ -86,12 +102,12 @@ where
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    pub(super) fn new(func: F, latch: L, injected: bool) -> StackJob<L, F, R> {
+    pub(super) fn new(func: F, latch: L, worker_thread_index: Option<usize>) -> StackJob<L, F, R> {
         StackJob {
             latch,
             func: UnsafeCell::new(Some(func)),
             result: UnsafeCell::new(JobResult::None),
-            injected,
+            worker_thread_index,
         }
     }
 
@@ -114,7 +130,7 @@ where
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    unsafe fn execute(this: *const Self, injected: bool) {
+    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>) {
         fn call<R>(func: impl FnOnce(bool) -> R, injected: bool) -> impl FnOnce() -> R {
             move || func(injected)
         }
@@ -122,11 +138,17 @@ where
         let this = &*this;
         let abort = unwind::AbortIfPanic;
         let func = (*this.func.get()).take().unwrap();
+        let injected = if let Some(index) = this.worker_thread_index {
+            index != context.worker_thread.index
+        } else {
+            true
+        };
+
         (*this.result.get()) =
             // If the injected parameter we receive is true, then this job has definitely
             // been injected and we pass this to the function. Otherwise, we fall back to
             // whatever boolean value this job was created with: (*this).injected.
-            match unwind::halt_unwinding(call(func, injected || (*this).injected)) {
+            match unwind::halt_unwinding(call(func, injected)) {
                 Ok(x) => JobResult::Ok(x),
                 Err(x) => JobResult::Panic(x),
             };
@@ -171,7 +193,7 @@ impl<BODY> Job for HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    unsafe fn execute(this: *const Self, _: bool) {
+    unsafe fn execute<'a>(this: *const Self, _: ExecutionContext<'a>) {
         let this: Box<Self> = mem::transmute(this);
         let job = (*this.job.get()).take().unwrap();
         job();
@@ -193,7 +215,7 @@ impl<T> JobResult<T> {
 }
 
 // Represents top level task
-pub(super) struct TaskJob<'a, L, F>
+pub(super) struct TaskJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
@@ -201,21 +223,18 @@ where
     pub(super) latch: L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
-    worker_thread: &'a WorkerThread,
-    // suspended_deque: &'b  // need to use some kind of reference, channel, segmented vector, or something
 }
 
-impl<'a, L, F> TaskJob<'a, L, F>
+impl<L, F> TaskJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    pub(super) fn new(future: F, latch: L, worker_thread: &'a WorkerThread) -> Self {
+    pub(super) fn new(future: F, latch: L) -> Self {
         Self {
             latch,
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
-            worker_thread,
         }
     }
 
@@ -233,6 +252,9 @@ fn raw_dummy_waker() -> RawWaker {
     fn clone(_: *const ()) -> RawWaker {
         raw_dummy_waker()
     }
+    fn wake(data: *const ()) {
+        // data.worker_thread.stealable_deques[]
+    }
 
     let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
     RawWaker::new(0 as *const (), vtable)
@@ -242,24 +264,27 @@ fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(raw_dummy_waker()) }
 }
 
-impl<'a, L, F> Job for TaskJob<'a, L, F>
+impl<L, F> Job for TaskJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    unsafe fn execute(this: *const Self, _: bool) {
+    unsafe fn execute<'a>(this: *const Self, _: ExecutionContext<'a>) {
         let this = &*this;
         let abort = unwind::AbortIfPanic;
 
-        let execute_poll = || match Pin::new_unchecked(&mut *this.future.get())
-            .poll(&mut Context::from_waker(&dummy_waker()))
-        {
+        let pinned_future = Pin::new_unchecked(&mut *this.future.get());
+        let execute_poll = || match pinned_future.poll(&mut Context::from_waker(&dummy_waker())) {
             Poll::Ready(x) => {
                 *(this.result.get()) = JobResult::Ok(x);
                 this.latch.set();
             }
             Poll::Pending => {
-                this.worker_thread.suspend_deque();
+                // suspend_deque here
+
+                // TODO: should we put some sort of latch here that waker needs to wait on before
+                // actually performing waking logic? So that deque suspension etc. guaranteed to
+                // happen first
             }
         };
 
@@ -294,11 +319,11 @@ impl JobFifo {
 }
 
 impl Job for JobFifo {
-    unsafe fn execute(this: *const Self, injected: bool) {
+    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>) {
         // We "execute" a queue by executing its first job, FIFO.
         loop {
             match (*this).inner.steal() {
-                Steal::Success(job_ref) => break job_ref.execute(injected),
+                Steal::Success(job_ref) => break job_ref.execute(context),
                 Steal::Empty => panic!("FIFO is empty"),
                 Steal::Retry => {}
             }

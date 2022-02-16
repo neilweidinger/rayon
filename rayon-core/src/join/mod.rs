@@ -114,6 +114,7 @@ where
 /// the second job is stolen by a different thread, or if
 /// `join_context` was called from outside the thread pool to begin
 /// with.
+// TODO: should probably refactor to use ExecutionContext
 pub fn join_context<A, B, RA, RB>(oper_a: A, oper_b: B) -> (RA, RB)
 where
     A: FnOnce(FnContext) -> RA + Send,
@@ -127,14 +128,32 @@ where
     }
 
     registry::in_worker(|worker_thread, injected| unsafe {
-        // Create virtual wrapper for task b; this all has to be
+        // Create virtual wrapper for tasks; this all has to be
         // done here so that the stack frame can keep it all live
         // long enough.
-        let job_b = StackJob::new(call(oper_b), SpinLatch::new(worker_thread), injected);
+
+        // if told we've been explicitly injected via the injected parameter when this closure is
+        // called, override the worker thread index this job was created on and instead ensure that
+        // our jobs will always have an execution injection context of true
+        let worker_thread_index = if injected {
+            None
+        } else {
+            Some(worker_thread.index)
+        };
+
+        let job_b = StackJob::new(
+            call(oper_b),
+            SpinLatch::new(worker_thread),
+            worker_thread_index,
+        );
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
-        let job_a = StackJob::new(call(oper_a), SpinLatch::new(worker_thread), injected);
+        let job_a = StackJob::new(
+            call(oper_a),
+            SpinLatch::new(worker_thread),
+            worker_thread_index,
+        );
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
@@ -157,13 +176,13 @@ where
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread), worker_thread);
+        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread), worker_thread);
+        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
