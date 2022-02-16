@@ -22,7 +22,7 @@ use std::ops::{Deref, DerefMut};
 use std::ptr;
 #[allow(deprecated)]
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
-use std::sync::{Arc, Once};
+use std::sync::{Arc, Mutex, Once};
 use std::thread;
 use std::usize;
 
@@ -34,7 +34,7 @@ pub struct ThreadBuilder {
     active_deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
+    stealable_deques: Arc<Vec<StealableSet>>,
 }
 
 impl ThreadBuilder {
@@ -263,12 +263,12 @@ impl Registry {
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        let stealable_deques: Vec<_> = deques
-            .iter()
-            .map(|deque| DashSet::<DequeId>::from_iter([deque.id]))
-            .collect();
-
-        let stealable_deques = Arc::new(stealable_deques);
+        let stealable_deques = Arc::new(
+            deques
+                .iter()
+                .map(|deque| IntoIterator::into_iter([deque.id]).collect::<StealableSet>())
+                .collect::<Vec<_>>(),
+        );
 
         for (index, deque) in deques.into_iter().enumerate() {
             let thread = ThreadBuilder {
@@ -681,10 +681,32 @@ impl DerefMut for Deque {
 // TODO: absolutely need to make sure this is safe
 unsafe impl Sync for Deque {}
 
+struct StealableSet {
+    stealable_deque_ids: Mutex<(Vec<DequeId>, XorShift64Star)>,
+}
+
+impl StealableSet {
+    fn get_random_deque_id(&self) -> DequeId {
+        let guard = self.stealable_deque_ids.lock().unwrap();
+        let (ref v, ref rng) = *guard;
+        let random_index = rng.next_usize(v.len());
+
+        v[random_index]
+    }
+}
+
+impl FromIterator<DequeId> for StealableSet {
+    fn from_iter<I: IntoIterator<Item = DequeId>>(iter: I) -> Self {
+        Self {
+            stealable_deque_ids: Mutex::new((iter.into_iter().collect(), XorShift64Star::new())),
+        }
+    }
+}
+
 pub(super) struct WorkerThread {
     /// the "worker" half of our local deque
     active_deque: UnsafeCell<Option<Deque>>,
-    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
+    stealable_deques: Arc<Vec<StealableSet>>,
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -881,14 +903,8 @@ impl WorkerThread {
                 .chain(0..start)
                 .filter(move |&i| i != self.index)
                 .find_map(|victim_index| {
-                    let victim_stealables = &self.stealable_deques[victim_index];
+                    let victim_stealable_set = &self.stealable_deques[victim_index];
 
-                    let random_index = match victim_stealables.len() {
-                        0 => return None,
-                        len => self.rng.next_usize(len),
-                    };
-
-                    // TODO: this iteration strategy of selecting a random deque is super inefficient, must change
                     // If we receive a None here, this means another thread stole and subsequently
                     // removed this victim deque before we did, and we must retry
                     // TODO: see if retrying impacts scheduling algorithm analysis, e.g. do we keep
@@ -897,7 +913,7 @@ impl WorkerThread {
                     // TODO: random index selection based on stealable set size and deque id
                     // retrieval based on random index are not atomic, see if this actually matters
                     // in practice
-                    let victim_deque_id = victim_stealables.iter().nth(random_index)?.clone();
+                    let victim_deque_id = victim_stealable_set.get_random_deque_id();
                     let victim_deque_stealer =
                         self.registry.deque_stealers.get(&victim_deque_id)?;
 
@@ -934,13 +950,13 @@ impl WorkerThread {
     }
 
     pub(super) fn suspend_deque(&self) {
-        let mut active_deque = unsafe { &mut *self.active_deque.get() }.take().unwrap();
-        active_deque.state = DequeState::Suspended;
+        // let mut active_deque = unsafe { &mut *self.active_deque.get() }.take().unwrap();
+        // active_deque.state = DequeState::Suspended;
 
-        if !active_deque.is_empty() {
-            let random_index = 0;
-            self.stealable_deques[random_index].insert(active_deque.id);
-        }
+        // if !active_deque.is_empty() {
+        //     let random_index = 0;
+        //     self.stealable_deques[random_index].insert(active_deque.id);
+        // }
     }
 }
 
@@ -950,7 +966,7 @@ unsafe fn main_loop(
     deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    stealable_deques: Arc<Vec<DashSet<DequeId>>>,
+    stealable_deques: Arc<Vec<StealableSet>>,
 ) {
     // this is the only time a WorkerThread is created: this struct represents the state for the
     // current thread running the main loop function, and is used in another functions to retrieve

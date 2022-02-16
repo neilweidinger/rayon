@@ -263,12 +263,9 @@ where
             }
         };
 
-        match unwind::halt_unwinding(execute_poll) {
-            Err(panic) => {
-                *(this.result.get()) = JobResult::Panic(panic);
-                this.latch.set();
-            }
-            _ => {}
+        if let Err(panic) = unwind::halt_unwinding(execute_poll) {
+            *(this.result.get()) = JobResult::Panic(panic);
+            this.latch.set();
         };
 
         mem::forget(abort);
