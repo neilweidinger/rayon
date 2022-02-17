@@ -288,8 +288,9 @@ where
             Poll::Pending => {
                 let worker_thread = context.worker_thread;
                 let stealable_sets = context.worker_thread.stealable_sets();
+                // Set active deque for worker thread to None so that thread steals on next round
                 let active_deque = unsafe { &mut *worker_thread.active_deque().get() }
-                    .as_mut()
+                    .take()
                     .unwrap();
 
                 // Mark this JobRef as suspended, so that in the case where this JobRef gets pushed
@@ -331,6 +332,11 @@ where
                     stealable_sets[random_victim_index]
                         .add_deque(active_deque.id(), DequeState::Suspended);
                 }
+
+                // Move ex active deque to bench, so that it can live somewhere (the
+                // deque must not be dropped, since it will be resumed again later when the future
+                // completes)
+                worker_thread.registry().deque_bench().insert(active_deque);
 
                 // TODO: should we put some sort of latch here that waker needs to wait on before
                 // actually performing waking logic? So that deque suspension etc. guaranteed to

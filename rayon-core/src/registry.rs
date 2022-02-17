@@ -223,6 +223,7 @@ impl<'a> Drop for Terminator<'a> {
 }
 
 impl Registry {
+    #[must_use]
     pub(super) fn new<S>(
         mut builder: ThreadPoolBuilder<S>,
     ) -> Result<Arc<Self>, ThreadPoolBuildError>
@@ -296,6 +297,7 @@ impl Registry {
         Ok(registry.clone())
     }
 
+    #[must_use]
     pub(super) fn current() -> Arc<Registry> {
         unsafe {
             let worker_thread = WorkerThread::current();
@@ -310,6 +312,7 @@ impl Registry {
     /// Returns the number of threads in the current registry.  This
     /// is better than `Registry::current().num_threads()` because it
     /// avoids incrementing the `Arc`.
+    #[must_use]
     pub(super) fn current_num_threads() -> usize {
         unsafe {
             let worker_thread = WorkerThread::current();
@@ -322,6 +325,7 @@ impl Registry {
     }
 
     /// Returns the current `WorkerThread` if it's part of this `Registry`.
+    #[must_use]
     pub(super) fn current_thread(&self) -> Option<&WorkerThread> {
         unsafe {
             let worker = WorkerThread::current().as_ref()?;
@@ -334,12 +338,19 @@ impl Registry {
     }
 
     /// Returns an opaque identifier for this registry.
+    #[must_use]
     pub(super) fn id(&self) -> RegistryId {
         // We can rely on `self` not to change since we only ever create
         // registries that are boxed up in an `Arc` (see `new()` above).
         RegistryId {
             addr: self as *const Self as usize,
         }
+    }
+
+    #[inline]
+    #[must_use]
+    pub(super) fn deque_bench(&self) -> &DashSet<Deque> {
+        &self.deque_bench
     }
 
     #[inline]
@@ -608,6 +619,7 @@ struct ThreadInfo {
 }
 
 impl ThreadInfo {
+    #[must_use]
     fn new() -> ThreadInfo {
         ThreadInfo {
             primed: LockLatch::new(),
@@ -810,29 +822,33 @@ impl WorkerThread {
 
     /// Returns the registry that owns this worker thread.
     #[inline]
+    #[must_use]
     pub(super) fn registry(&self) -> &Arc<Registry> {
         &self.registry
     }
 
-    #[inline]
-    pub(super) fn log(&self, event: impl FnOnce() -> crate::log::Event) {
-        self.registry.logger.log(event)
-    }
-
     /// Our index amongst the worker threads (ranges from `0..self.num_threads()`).
     #[inline]
+    #[must_use]
     pub(super) fn index(&self) -> usize {
         self.index
     }
 
     #[inline]
+    #[must_use]
     pub(super) fn active_deque(&self) -> &UnsafeCell<Option<Deque>> {
         &self.active_deque
     }
 
     #[inline]
+    #[must_use]
     pub(super) fn stealable_sets(&self) -> &Arc<Vec<StealableSet>> {
         &self.stealable_sets
+    }
+
+    #[inline]
+    pub(super) fn log(&self, event: impl FnOnce() -> crate::log::Event) {
+        self.registry.logger.log(event)
     }
 
     #[inline]
@@ -862,6 +878,7 @@ impl WorkerThread {
     /// for breadth-first execution, it would mean dequeuing from the
     /// bottom.
     #[inline]
+    #[must_use]
     pub(super) fn take_local_job(&self) -> Option<JobRef> {
         let active_deque = unsafe { &mut *self.active_deque.get() }.as_mut().unwrap();
         let popped_job = active_deque.pop();
@@ -940,6 +957,7 @@ impl WorkerThread {
     ///
     /// This should only be done as a last resort, when there is no
     /// local work to do.
+    #[must_use]
     fn steal(&self) -> Option<JobRef> {
         // we only steal when we don't have any work to do locally
         debug_assert!(self.local_deque_is_empty());
