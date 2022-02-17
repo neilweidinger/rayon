@@ -1,5 +1,5 @@
 use crate::latch::Latch;
-use crate::registry::WorkerThread;
+use crate::registry::{DequeState, WorkerThread};
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
@@ -18,14 +18,16 @@ pub(super) enum JobResult<T> {
 
 pub(super) struct ExecutionContext<'a> {
     worker_thread: &'a WorkerThread,
+    job_ref: JobRef,
     /// disable `Send` and `Sync`, just for a little future-proofing.
     _marker: PhantomData<*mut ()>,
 }
 
 impl<'a> ExecutionContext<'a> {
-    pub(super) fn new(worker_thread: &'a WorkerThread) -> Self {
+    pub(super) fn new(worker_thread: &'a WorkerThread, job_ref: JobRef) -> Self {
         Self {
             worker_thread,
+            job_ref,
             _marker: PhantomData,
         }
     }
@@ -40,7 +42,7 @@ pub(super) trait Job {
     /// Unsafe: this may be called from a different thread than the one
     /// which scheduled the job, so the implementer must ensure the
     /// appropriate traits are met, whether `Send`, `Sync`, or both.
-    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>);
+    unsafe fn execute(this: *const Self, context: ExecutionContext<'_>);
 }
 
 /// Effectively a Job trait object. Each JobRef **must** be executed
@@ -53,6 +55,7 @@ pub(super) trait Job {
 pub(super) struct JobRef {
     pointer: *const (),
     execute_fn: for<'a> unsafe fn(*const (), ExecutionContext<'a>),
+    suspended: bool,
 }
 
 unsafe impl Send for JobRef {}
@@ -71,12 +74,15 @@ impl JobRef {
         JobRef {
             pointer: data as *const (),
             execute_fn: mem::transmute(fn_ptr),
+            suspended: false,
         }
     }
 
     #[inline]
-    pub(super) unsafe fn execute<'a>(&self, context: ExecutionContext<'a>) {
-        (self.execute_fn)(self.pointer, context)
+    pub(super) unsafe fn execute(context: ExecutionContext<'_>) {
+        let execute_fn = context.job_ref.execute_fn;
+        let job_pointer = context.job_ref.pointer;
+        execute_fn(job_pointer, context);
     }
 }
 
@@ -130,7 +136,7 @@ where
     F: FnOnce(bool) -> R + Send,
     R: Send,
 {
-    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>) {
+    unsafe fn execute(this: *const Self, context: ExecutionContext<'_>) {
         fn call<R>(func: impl FnOnce(bool) -> R, injected: bool) -> impl FnOnce() -> R {
             move || func(injected)
         }
@@ -139,7 +145,7 @@ where
         let abort = unwind::AbortIfPanic;
         let func = (*this.func.get()).take().unwrap();
         let injected = if let Some(index) = this.worker_thread_index {
-            index != context.worker_thread.index
+            index != context.worker_thread.index()
         } else {
             true
         };
@@ -193,7 +199,7 @@ impl<BODY> Job for HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    unsafe fn execute<'a>(this: *const Self, _: ExecutionContext<'a>) {
+    unsafe fn execute(this: *const Self, _: ExecutionContext<'_>) {
         let this: Box<Self> = mem::transmute(this);
         let job = (*this.job.get()).take().unwrap();
         job();
@@ -215,7 +221,7 @@ impl<T> JobResult<T> {
 }
 
 // Represents top level task
-pub(super) struct TaskJob<L, F>
+pub(super) struct FutureJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
@@ -225,7 +231,7 @@ where
     result: UnsafeCell<JobResult<F::Output>>,
 }
 
-impl<L, F> TaskJob<L, F>
+impl<L, F> FutureJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
@@ -264,12 +270,12 @@ fn dummy_waker() -> Waker {
     unsafe { Waker::from_raw(raw_dummy_waker()) }
 }
 
-impl<L, F> Job for TaskJob<L, F>
+impl<L, F> Job for FutureJob<L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    unsafe fn execute<'a>(this: *const Self, _: ExecutionContext<'a>) {
+    unsafe fn execute(this: *const Self, mut context: ExecutionContext<'_>) {
         let this = &*this;
         let abort = unwind::AbortIfPanic;
 
@@ -280,7 +286,51 @@ where
                 this.latch.set();
             }
             Poll::Pending => {
-                // suspend_deque here
+                let worker_thread = context.worker_thread;
+                let stealable_sets = context.worker_thread.stealable_sets();
+                let active_deque = unsafe { &mut *worker_thread.active_deque().get() }
+                    .as_mut()
+                    .unwrap();
+
+                // Mark this JobRef as suspended, so that in the case where this JobRef gets pushed
+                // onto the active deque and this suspended JobRef is the only thing in the deque,
+                // but before we can remove this deque from being stolen (by removing it from the
+                // threads stealable set) another thread that is stealing selects this active deque
+                // as a victim and pops this suspended JobRef, it can see that it is suspended and
+                // continue another round of stealing.
+                // TODO: how can we make sure suspended flag gets set before we push to deque? Are
+                // we guaranteed this sequence of operations? Or do we need something crazy like an
+                // atomic fence or similar? Do even need this suspended flag if we ensure to remove
+                // the deque from its stealable set first (yes, I think we do, since if there are
+                // non-suspended jobs in the deque and we add to a victim's stealable set, and
+                // these jobs are then popped off by stealers, the stealer that eventually gets to
+                // the bottom of the deque and finds this suspended job, if the future has not yet
+                // completed, must not execute this suspended job)?
+                context.job_ref.suspended = true;
+
+                // Push FutureJob to this currently active deque that we will promptly suspend.
+                // When this deck is resumable again when the future completes, the FutureJob will
+                // be easily accessible by being poppped off by whatver worker thread has this
+                // deque as its active deque.
+                active_deque.push(context.job_ref);
+
+                // Remove deque from stealable set to prevent from being stolen from; we will add
+                // to another threads stealable set if we see the deque contains other
+                // non-suspended jobs. If it does not and only contains the one suspended job, this
+                // deque will not be found in any stealable set and as such will not be able to be
+                // stolen from.
+                stealable_sets[worker_thread.index()].remove_deque(active_deque.id());
+
+                if active_deque.contains_non_suspended_jobs() {
+                    let random_victim_index = 0_usize;
+
+                    // If the deque contains non-suspended jobs, it still contains work and can be
+                    // stolen from. As such add the deque to a random victim's stealable set. We
+                    // also mark the deque state as suspended. Since in our implementation we keep
+                    // track of deque states in stealable sets, we only have to do this here
+                    stealable_sets[random_victim_index]
+                        .add_deque(active_deque.id(), DequeState::Suspended);
+                }
 
                 // TODO: should we put some sort of latch here that waker needs to wait on before
                 // actually performing waking logic? So that deque suspension etc. guaranteed to
@@ -319,11 +369,15 @@ impl JobFifo {
 }
 
 impl Job for JobFifo {
-    unsafe fn execute<'a>(this: *const Self, context: ExecutionContext<'a>) {
+    unsafe fn execute(this: *const Self, mut context: ExecutionContext<'_>) {
         // We "execute" a queue by executing its first job, FIFO.
         loop {
             match (*this).inner.steal() {
-                Steal::Success(job_ref) => break job_ref.execute(context),
+                Steal::Success(job_ref) => {
+                    context.job_ref = job_ref;
+                    JobRef::execute(context);
+                    break;
+                }
                 Steal::Empty => panic!("FIFO is empty"),
                 Steal::Retry => {}
             }

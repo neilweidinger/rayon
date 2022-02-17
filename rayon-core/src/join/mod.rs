@@ -1,4 +1,4 @@
-use crate::job::{StackJob, TaskJob};
+use crate::job::{FutureJob, StackJob};
 use crate::latch::SpinLatch;
 use crate::registry::{self, WorkerThread};
 use crate::unwind;
@@ -138,7 +138,7 @@ where
         let worker_thread_index = if injected {
             None
         } else {
-            Some(worker_thread.index)
+            Some(worker_thread.index())
         };
 
         let job_b = StackJob::new(
@@ -176,13 +176,13 @@ where
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_b = TaskJob::new(future_b, SpinLatch::new(worker_thread));
+        let job_b = FutureJob::new(future_b, SpinLatch::new(worker_thread));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
-        let job_a = TaskJob::new(future_a, SpinLatch::new(worker_thread));
+        let job_a = FutureJob::new(future_a, SpinLatch::new(worker_thread));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
 
