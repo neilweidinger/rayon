@@ -1,5 +1,5 @@
 use crate::latch::Latch;
-use crate::registry::{DequeState, WorkerThread};
+use crate::registry::{DequeId, DequeState, Stealables, WorkerThread, XorShift64Star};
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
@@ -8,6 +8,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::pin::Pin;
+use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
 pub(super) enum JobResult<T> {
@@ -19,6 +20,7 @@ pub(super) enum JobResult<T> {
 pub(super) struct ExecutionContext<'a> {
     worker_thread: &'a WorkerThread,
     job_ref: JobRef,
+
     /// disable `Send` and `Sync`, just for a little future-proofing.
     _marker: PhantomData<*mut ()>,
 }
@@ -229,6 +231,7 @@ where
     pub(super) latch: L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
+    waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here on stack to avoid heap allocation
 }
 
 impl<L, F> FutureJob<L, F>
@@ -241,6 +244,7 @@ where
             latch,
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
+            waker: UnsafeCell::new(None),
         }
     }
 
@@ -253,21 +257,61 @@ where
     }
 }
 
-fn raw_dummy_waker() -> RawWaker {
-    fn no_op(_: *const ()) {}
-    fn clone(_: *const ()) -> RawWaker {
-        raw_dummy_waker()
-    }
-    fn wake(data: *const ()) {
-        // data.worker_thread.stealable_deques[]
-    }
-
-    let vtable = &RawWakerVTable::new(clone, no_op, no_op, no_op);
-    RawWaker::new(0 as *const (), vtable)
+thread_local! {
+    static RNG: XorShift64Star = XorShift64Star::new(); // TODO: thread local to avoid creating new rng on every FutureJob
+                                                        // creation, is optimization really necessary?
 }
 
-fn dummy_waker() -> Waker {
-    unsafe { Waker::from_raw(raw_dummy_waker()) }
+#[derive(Clone)]
+struct FutureJobWaker {
+    stealables: *const Arc<Stealables>, // raw pointer to hide lifetime
+    suspended_deque_id: DequeId,
+}
+
+impl FutureJobWaker {
+    fn wake_by_ref(&self) {
+        // Get the current (and soon to be replaced) state of the deque. Use this to later check if
+        // deque needs to be moved into a stealable set or not.
+        let stealables = unsafe { &*self.stealables };
+        let (_, deque_state) = stealables
+            .get_deque_stealer_and_state(self.suspended_deque_id)
+            .unwrap();
+        stealables.update_deque_state(self.suspended_deque_id, DequeState::Active);
+
+        // If deque not already in a stealable set, we must place it in some thread's stealable set.
+        if deque_state == DequeState::Suspended {
+            RNG.with(|rng| {
+                let random_victim_index = rng.next_usize(stealables.get_num_threads());
+
+                // Insert this ex-suspended and now resumable deque into a random victim's stealable set
+                // Corresponds to markSuspendedResumable(future.suspended) in ProWS line 39
+                stealables.add_deque(random_victim_index, self.suspended_deque_id);
+            });
+        }
+    }
+
+    const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
+        FutureJobWaker::vtable_clone,
+        FutureJobWaker::vtable_wake,
+        FutureJobWaker::vtable_wake_by_ref,
+        FutureJobWaker::vtable_drop,
+    );
+
+    unsafe fn vtable_clone(data: *const ()) -> RawWaker {
+        RawWaker::new(data, &FutureJobWaker::WAKER_VTABLE)
+    }
+
+    unsafe fn vtable_wake(data: *const ()) {
+        FutureJobWaker::wake_by_ref(&*(data as *const FutureJobWaker));
+    }
+
+    unsafe fn vtable_wake_by_ref(data: *const ()) {
+        FutureJobWaker::wake_by_ref(&*(data as *const FutureJobWaker));
+    }
+
+    unsafe fn vtable_drop(_: *const ()) {
+        // Do nothing here, as FutureJobWaker contains no resources
+    }
 }
 
 impl<L, F> Job for FutureJob<L, F>
@@ -275,23 +319,41 @@ where
     L: Latch + Sync,
     F: Future,
 {
-    unsafe fn execute(this: *const Self, mut context: ExecutionContext<'_>) {
+    unsafe fn execute(this: *const Self, mut execution_context: ExecutionContext<'_>) {
         let this = &*this;
         let abort = unwind::AbortIfPanic;
 
+        let suspended_deque_id = { &*execution_context.worker_thread.active_deque().get() }
+            .as_ref()
+            .unwrap()
+            .id();
+        let future_job_waker = FutureJobWaker {
+            stealables: execution_context.worker_thread.stealables(),
+            suspended_deque_id,
+        };
+
+        // Insert future job waker data into this FutureJob so that it lives there
+        *this.waker.get() = Some(future_job_waker);
+        let future_job_waker_ptr =
+            { &*this.waker.get() }.as_ref().unwrap() as *const FutureJobWaker;
+
+        let waker = Waker::from_raw(RawWaker::new(
+            future_job_waker_ptr as *const (),
+            &FutureJobWaker::WAKER_VTABLE,
+        ));
+        let mut context = Context::from_waker(&waker);
         let pinned_future = Pin::new_unchecked(&mut *this.future.get());
-        let execute_poll = || match pinned_future.poll(&mut Context::from_waker(&dummy_waker())) {
+
+        let execute_poll = || match pinned_future.poll(&mut context) {
             Poll::Ready(x) => {
                 *(this.result.get()) = JobResult::Ok(x);
                 this.latch.set();
             }
             Poll::Pending => {
-                let worker_thread = context.worker_thread;
-                let stealable_sets = context.worker_thread.stealable_sets();
+                let worker_thread = execution_context.worker_thread;
+                let stealables = execution_context.worker_thread.stealables();
                 // Set active deque for worker thread to None so that thread steals on next round
-                let active_deque = unsafe { &mut *worker_thread.active_deque().get() }
-                    .take()
-                    .unwrap();
+                let active_deque = { &mut *worker_thread.active_deque().get() }.take().unwrap();
 
                 // Mark this JobRef as suspended, so that in the case where this JobRef gets pushed
                 // onto the active deque and this suspended JobRef is the only thing in the deque,
@@ -307,35 +369,43 @@ where
                 // these jobs are then popped off by stealers, the stealer that eventually gets to
                 // the bottom of the deque and finds this suspended job, if the future has not yet
                 // completed, must not execute this suspended job)?
-                context.job_ref.suspended = true;
+                execution_context.job_ref.suspended = true;
 
                 // Push FutureJob to this currently active deque that we will promptly suspend.
                 // When this deck is resumable again when the future completes, the FutureJob will
                 // be easily accessible by being poppped off by whatver worker thread has this
                 // deque as its active deque.
-                active_deque.push(context.job_ref);
+                active_deque.push(execution_context.job_ref);
 
-                // Remove deque from stealable set to prevent from being stolen from; we will add
-                // to another threads stealable set if we see the deque contains other
-                // non-suspended jobs. If it does not and only contains the one suspended job, this
-                // deque will not be found in any stealable set and as such will not be able to be
-                // stolen from.
-                stealable_sets[worker_thread.index()].remove_deque(active_deque.id());
+                // Remove deque from stealable set to prevent being stolen from; we will add to
+                // another threads stealable set if we see the deque contains other non-suspended
+                // jobs. If it does not and only contains the one suspended job, this deque will
+                // not be found in any stealable set and as such will not be able to be stolen
+                // from.
+                stealables.remove_deque(worker_thread.index(), active_deque.id());
 
                 if active_deque.contains_non_suspended_jobs() {
-                    let random_victim_index = 0_usize;
+                    // Mark the deque state as SuspendedButStealable, so that if the future wakes
+                    // up and this deque still has other ready jobs we know to leave the deque in
+                    // whatever stealable set it already is in.
+                    stealables
+                        .update_deque_state(active_deque.id(), DequeState::SuspendedButStealable);
+
+                    let random_victim_index = 0_usize; // TODO: make this actually random
 
                     // If the deque contains non-suspended jobs, it still contains work and can be
                     // stolen from. As such add the deque to a random victim's stealable set. We
                     // also mark the deque state as suspended. Since in our implementation we keep
-                    // track of deque states in stealable sets, we only have to do this here
-                    stealable_sets[random_victim_index]
-                        .add_deque(active_deque.id(), DequeState::Suspended);
+                    // track of deque states in stealable sets, we only have to do this here.
+                    stealables.add_deque(random_victim_index, active_deque.id());
+                } else {
+                    // Mark the deque as Suspended, so that when the future wakes up we know that
+                    // this deque must be moved into some thread's stealable set.
+                    stealables.update_deque_state(active_deque.id(), DequeState::Suspended);
                 }
 
-                // Move ex active deque to bench, so that it can live somewhere (the
-                // deque must not be dropped, since it will be resumed again later when the future
-                // completes)
+                // Move ex-active deque to the bench, so that it can live somewhere (the deque must
+                // not be dropped, since it will be resumed again later when the future completes)
                 worker_thread.registry().deque_bench().insert(active_deque);
 
                 // TODO: should we put some sort of latch here that waker needs to wait on before

@@ -35,7 +35,7 @@ pub struct ThreadBuilder {
     active_deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    stealable_deques: Arc<Vec<StealableSet>>,
+    stealables: Arc<Stealables>,
 }
 
 impl ThreadBuilder {
@@ -62,7 +62,7 @@ impl ThreadBuilder {
                 self.active_deque,
                 self.registry,
                 self.index,
-                self.stealable_deques,
+                self.stealables,
             )
         }
     }
@@ -151,7 +151,6 @@ pub(super) struct Registry {
     start_handler: Option<Box<StartHandler>>,
     exit_handler: Option<Box<ExitHandler>>,
     deque_bench: DashSet<Deque>,
-    deque_stealers: DashMap<DequeId, Stealer<JobRef>>,
     next_deque_id: AtomicUsize, // TODO: come up with better ID generation/handling
 
     // When this latch reaches 0, it means that all work on this
@@ -244,8 +243,6 @@ impl Registry {
             })
             .collect();
 
-        let deque_stealers =
-            DashMap::from_iter(deques.iter().map(|deque| (deque.id, deque.stealer()))); // TODO: create with capacity? CachePadded??
         let logger = Logger::new(n_threads);
 
         let registry = Arc::new(Registry {
@@ -258,20 +255,10 @@ impl Registry {
             start_handler: builder.take_start_handler(),
             exit_handler: builder.take_exit_handler(),
             deque_bench: DashSet::<Deque>::new(), // TODO: make CachePadded?
-            deque_stealers,
             next_deque_id: deque_id,
         });
 
-        let stealable_deques = Arc::new(
-            // TODO: make CachePadded??
-            deques
-                .iter()
-                .map(|deque| {
-                    IntoIterator::into_iter([(deque.id, DequeState::Active)])
-                        .collect::<StealableSet>()
-                })
-                .collect::<Vec<_>>(),
-        );
+        let stealables = Arc::new(deques.iter().collect::<Stealables>());
 
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
@@ -283,7 +270,7 @@ impl Registry {
                 registry: registry.clone(),
                 active_deque: deque,
                 index,
-                stealable_deques: stealable_deques.clone(),
+                stealables: stealables.clone(),
             };
 
             if let Err(e) = builder.get_spawn_handler().spawn(thread) {
@@ -632,9 +619,11 @@ impl ThreadInfo {
 /// ////////////////////////////////////////////////////////////////////////
 /// WorkerThread identifiers
 
+#[derive(Copy, Clone, PartialEq, Eq)]
 pub(super) enum DequeState {
     Active,
     Suspended,
+    SuspendedButStealable,
     Resumable,
     Muggable,
 }
@@ -714,50 +703,129 @@ impl DerefMut for Deque {
 // TODO: absolutely need to make sure this is safe
 unsafe impl Sync for Deque {}
 
-// Basically contains a set of stealable deque IDs
-pub(super) struct StealableSet {
-    stealable_deque_ids: Mutex<(
-        HashMap<DequeId, usize>,
-        Vec<(DequeId, DequeState)>,
-        XorShift64Star,
-    )>, // TODO: maybe use RwLock?
+pub(super) struct Stealables {
+    stealable_sets: Vec<StealableSet>,
+    deque_stealers: DashMap<DequeId, (Stealer<JobRef>, DequeState)>,
 }
 
-impl StealableSet {
+impl Stealables {
+    /// Update the state of a deque. Checking deque state is only important in two places: when
+    /// performing a steal and when the Future waker needs to know whether to insert a newly
+    /// resumable deque into a victim thread's stealable set or not (the newly resumable deque may
+    /// have been in the suspended state but still in a workers stealable set if the deque had
+    /// non-suspended jobs, or it may have only contained the suspended job and not have been in
+    /// any stealable set). Additionally, a suspended deque but with non-suspended jobs may have
+    /// randomly been rebalanced to other stealable sets.
+    ///
+    /// The Future Waker needs a quick way to determine whether a deque is in a stealable set or
+    /// not. TODO: finish this doc comment
+    pub(super) fn update_deque_state(&self, deque_id: DequeId, deque_state: DequeState) {
+        assert!(self.deque_stealers.contains_key(&deque_id));
+        assert!(self.deque_stealers.get_mut(&deque_id).is_some());
+
+        self.deque_stealers
+            .get_mut(&deque_id)
+            .unwrap()
+            .value_mut()
+            .1 = deque_state;
+    }
+
     #[must_use]
-    pub(super) fn get_random_deque_id(&self) -> DequeId {
-        let (_, v, rng) = &*self.stealable_deque_ids.lock().unwrap();
-        let random_index = rng.next_usize(v.len());
-        v[random_index].0
+    pub(super) fn get_deque_stealer_and_state(
+        &self,
+        deque_id: DequeId,
+    ) -> Option<(Stealer<JobRef>, DequeState)> {
+        self.deque_stealers.get(&deque_id).map(|entry| {
+            let (stealer, state) = &*entry;
+            (stealer.clone(), *state)
+        })
     }
 
-    pub(super) fn add_deque(&self, deque_id: DequeId, deque_state: DequeState) {
-        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
-        v.push((deque_id, deque_state)); // TODO: I'm pretty sure the only time we add deques to the stealable set
-                                         // is when they are in the suspended state, so don't think the deque_state
-                                         // parameter is strictly necessary
-        map.insert(deque_id, v.len() - 1);
+    #[must_use]
+    fn get_random_deque_id(&self, thread_id: usize) -> DequeId {
+        self.stealable_sets[thread_id].get_random_deque_id()
     }
 
-    pub(super) fn remove_deque(&self, deque_id: DequeId) {
-        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
-        let index = map.remove(&deque_id).unwrap();
-        let (deque_id, deque_state) = v.pop().unwrap();
+    // TODO: this function doesn't really belong to Stealables, try and find a nicer way to get the
+    // number of worker threads
+    #[must_use]
+    #[inline]
+    pub(super) fn get_num_threads(&self) -> usize {
+        self.stealable_sets.len()
+    }
 
-        // only if deque we want to remove is not in the tail position of the vector do we need to
-        // actually perform the tail swap maneuver
-        if index < v.len() {
-            v[index] = (deque_id, deque_state);
+    pub(super) fn add_deque(&self, thread_id: usize, deque_id: DequeId) {
+        assert!(thread_id < self.stealable_sets.len());
+        self.stealable_sets[thread_id].add_deque(deque_id);
+    }
+
+    pub(super) fn remove_deque(&self, thread_id: usize, deque_id: DequeId) {
+        self.stealable_sets[thread_id].remove_deque(deque_id);
+    }
+}
+
+impl<'a> FromIterator<&'a Deque> for Stealables {
+    /// Use only during creation of registry. This assumes that each deque in the iterator
+    /// represents the one *active* deque per thread during creation of the registry.
+    fn from_iter<I: IntoIterator<Item = &'a Deque>>(iter: I) -> Self {
+        let deque_stealers = DashMap::new(); // TODO: create with capacity? CachePadded??
+        let mut stealable_sets = Vec::new(); // TODO: create with capacity? CachePadded??
+
+        for deque in iter.into_iter() {
+            deque_stealers.insert(deque.id, (deque.stealer(), DequeState::Active));
+            stealable_sets.push(IntoIterator::into_iter([deque.id]).collect::<StealableSet>());
+        }
+
+        Self {
+            stealable_sets,
+            deque_stealers,
         }
     }
 }
 
-impl FromIterator<(DequeId, DequeState)> for StealableSet {
-    fn from_iter<I: IntoIterator<Item = (DequeId, DequeState)>>(iter: I) -> Self {
+// Basically contains a set of stealable deque IDs
+struct StealableSet {
+    stealable_deque_ids: Mutex<(HashMap<DequeId, usize>, Vec<DequeId>, XorShift64Star)>, // TODO: maybe use RwLock?
+}
+
+impl StealableSet {
+    #[must_use]
+    fn get_random_deque_id(&self) -> DequeId {
+        let (_, v, rng) = &*self.stealable_deque_ids.lock().unwrap();
+        let random_index = rng.next_usize(v.len());
+        v[random_index]
+    }
+
+    fn add_deque(&self, deque_id: DequeId) {
+        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
+        v.push(deque_id); // TODO: I'm pretty sure the only time we add deques to the stealable set
+                          // is when they are in the suspended state, so don't think the deque_state
+                          // parameter is strictly necessary
+        map.insert(deque_id, v.len() - 1);
+    }
+
+    fn remove_deque(&self, deque_id: DequeId) {
+        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
+
+        assert!(map.contains_key(&deque_id));
+        let index = map.remove(&deque_id).unwrap();
+        assert!(!v.is_empty());
+        let deque_id = v.pop().unwrap();
+
+        // only if deque we want to remove is not in the tail position of the vector do we need to
+        // actually perform the tail swap maneuver
+        if index < v.len() {
+            v[index] = deque_id;
+        }
+    }
+}
+
+impl FromIterator<DequeId> for StealableSet {
+    fn from_iter<I: IntoIterator<Item = DequeId>>(iter: I) -> Self {
         let v: Vec<_> = iter.into_iter().collect();
         let mut map = HashMap::with_capacity(v.len());
 
-        for (index, (deque_id, _)) in v.iter().enumerate() {
+        for (index, deque_id) in v.iter().enumerate() {
             map.insert(*deque_id, index);
         }
 
@@ -768,9 +836,13 @@ impl FromIterator<(DequeId, DequeState)> for StealableSet {
 }
 
 pub(super) struct WorkerThread {
-    /// the "worker" half of our local deque
+    /// A worker thread owns its active deque, but all other deques (including a workers stealable
+    /// deques) are stored on the bench (owned by the registry). The alternative would be to hold a
+    /// reference, but this wouldn't work since the bench could reallocate invalidating any
+    /// references to inside of it.
+    /// TODO: perhaps a worker thread could just hold a DequeId instead?
     active_deque: UnsafeCell<Option<Deque>>,
-    stealable_sets: Arc<Vec<StealableSet>>,
+    stealables: Arc<Stealables>,
 
     /// local queue used for `spawn_fifo` indirection
     fifo: JobFifo,
@@ -842,8 +914,8 @@ impl WorkerThread {
 
     #[inline]
     #[must_use]
-    pub(super) fn stealable_sets(&self) -> &Arc<Vec<StealableSet>> {
-        &self.stealable_sets
+    pub(super) fn stealables(&self) -> &Arc<Stealables> {
+        &self.stealables
     }
 
     #[inline]
@@ -976,8 +1048,6 @@ impl WorkerThread {
                 .chain(0..start)
                 .filter(move |&i| i != self.index)
                 .find_map(|victim_index| {
-                    let victim_stealable_set = &self.stealable_sets[victim_index];
-
                     // If we receive a None here, this means another thread stole and subsequently
                     // removed this victim deque before we did, and we must retry
                     // TODO: see if retrying impacts scheduling algorithm analysis, e.g. do we keep
@@ -986,9 +1056,10 @@ impl WorkerThread {
                     // TODO: random index selection based on stealable set size and deque id
                     // retrieval based on random index are not atomic, see if this actually matters
                     // in practice
-                    let victim_deque_id = victim_stealable_set.get_random_deque_id();
-                    let victim_deque_stealer =
-                        self.registry.deque_stealers.get(&victim_deque_id)?;
+                    let victim_deque_id = self.stealables.get_random_deque_id(victim_index);
+                    let (victim_deque_stealer, _) = self
+                        .stealables
+                        .get_deque_stealer_and_state(victim_deque_id)?;
 
                     match victim_deque_stealer.steal() {
                         Steal::Success(job) => {
@@ -1032,7 +1103,7 @@ unsafe fn main_loop(
     deque: Deque,
     registry: Arc<Registry>,
     index: usize,
-    stealable_sets: Arc<Vec<StealableSet>>,
+    stealables: Arc<Stealables>,
 ) {
     // this is the only time a WorkerThread is created: this struct represents the state for the
     // current thread running the main loop function, and is used in another functions to retrieve
@@ -1044,7 +1115,7 @@ unsafe fn main_loop(
         index,
         rng: XorShift64Star::new(),
         registry: registry.clone(),
-        stealable_sets,
+        stealables,
     };
     WorkerThread::set_current(worker_thread);
 
@@ -1126,12 +1197,12 @@ where
 /// even tolerate weak seeding, as long as it's not zero.
 ///
 /// [xorshift*]: https://en.wikipedia.org/wiki/Xorshift#xorshift*
-struct XorShift64Star {
+pub(super) struct XorShift64Star {
     state: Cell<u64>,
 }
 
 impl XorShift64Star {
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         // Any non-zero seed will do -- this uses the hash of a global counter.
         let mut seed = 0;
         while seed == 0 {
@@ -1142,12 +1213,12 @@ impl XorShift64Star {
             seed = hasher.finish();
         }
 
-        XorShift64Star {
+        Self {
             state: Cell::new(seed),
         }
     }
 
-    fn next(&self) -> u64 {
+    pub(super) fn next(&self) -> u64 {
         let mut x = self.state.get();
         debug_assert_ne!(x, 0);
         x ^= x >> 12;
@@ -1158,7 +1229,7 @@ impl XorShift64Star {
     }
 
     /// Return a value from `0..n`.
-    fn next_usize(&self, n: usize) -> usize {
+    pub(super) fn next_usize(&self, n: usize) -> usize {
         (self.next() % n as u64) as usize
     }
 }
