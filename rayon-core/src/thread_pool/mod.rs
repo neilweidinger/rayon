@@ -177,7 +177,7 @@ impl ThreadPool {
     #[inline]
     pub fn current_thread_has_pending_tasks(&self) -> Option<bool> {
         let curr = self.registry.current_thread()?;
-        Some(!curr.local_deque_is_empty())
+        Some(!curr.active_deque_is_empty())
     }
 
     /// Execute `oper_a` and `oper_b` in the thread-pool and return
@@ -335,6 +335,6 @@ pub fn current_thread_index() -> Option<usize> {
 pub fn current_thread_has_pending_tasks() -> Option<bool> {
     unsafe {
         let curr = WorkerThread::current().as_ref()?;
-        Some(!curr.local_deque_is_empty())
+        Some(!curr.active_deque_is_empty())
     }
 }
