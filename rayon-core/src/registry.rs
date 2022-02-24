@@ -11,7 +11,7 @@ use crossbeam_deque::Worker as CrossbeamWorker;
 use crossbeam_deque::{Injector, Steal, Stealer};
 use dashmap::DashMap;
 use std::any::Any;
-use std::cell::{Cell, UnsafeCell};
+use std::cell::{Cell, RefCell};
 use std::collections::hash_map::DefaultHasher;
 use std::collections::HashMap;
 use std::fmt;
@@ -959,7 +959,7 @@ pub(super) struct WorkerThread {
     /// reference, but this wouldn't work since the bench could reallocate invalidating any
     /// references to inside of it.
     /// TODO: perhaps a worker thread could just hold a DequeId instead?
-    active_deque: UnsafeCell<Option<Deque>>,
+    active_deque: RefCell<Option<Deque>>,
     stealables: Arc<Stealables>,
     set_to_active_lock: Arc<Mutex<()>>,
 
@@ -1028,7 +1028,7 @@ impl WorkerThread {
 
     #[inline]
     #[must_use]
-    pub(super) fn active_deque(&self) -> &UnsafeCell<Option<Deque>> {
+    pub(super) fn active_deque(&self) -> &RefCell<Option<Deque>> {
         &self.active_deque
     }
 
@@ -1046,7 +1046,8 @@ impl WorkerThread {
     #[inline]
     pub(super) fn push(&self, job: JobRef) {
         self.log(|| JobPushed { worker: self.index });
-        let active_deque = unsafe { &mut *self.active_deque.get() }.as_mut().unwrap();
+        let r = &mut *self.active_deque.borrow_mut();
+        let active_deque = r.as_mut().unwrap();
         let queue_was_empty = active_deque.is_empty();
         active_deque.push(job);
         self.registry
@@ -1061,7 +1062,7 @@ impl WorkerThread {
 
     #[inline]
     pub(super) fn active_deque_is_empty(&self) -> bool {
-        match unsafe { &mut *self.active_deque.get() }.as_mut() {
+        match self.active_deque.borrow_mut().as_mut() {
             Some(active_deque) => active_deque.is_empty(),
             None => true,
         }
@@ -1075,7 +1076,8 @@ impl WorkerThread {
     #[must_use]
     pub(super) fn take_local_job(&self) -> Option<JobRef> {
         // possible that active_deque is None: this can happen when blocked future encountered
-        let active_deque = unsafe { &mut *self.active_deque.get() }.as_mut()?;
+        let mut t = self.active_deque.borrow_mut();
+        let active_deque = t.as_mut()?;
         let popped_job = active_deque.pop();
 
         if popped_job.is_some() {
@@ -1233,7 +1235,7 @@ impl WorkerThread {
                     // during the execution of its last job it encountered a blocked future (the
                     // worker thread active_deque is set to None so that here in the steal
                     // procedure we know to create a new deque)
-                    if unsafe { &*self.active_deque.get() }.is_none() {
+                    if self.active_deque.borrow_mut().is_none() {
                         // TODO: potential deque recycling optimization
                         let new_active_deque = if self.registry().breadth_first() {
                             Deque::new_fifo(DequeId(self.registry().next_deque_id()))
@@ -1241,9 +1243,7 @@ impl WorkerThread {
                             Deque::new_lifo(DequeId(self.registry().next_deque_id()))
                         };
 
-                        unsafe {
-                            *self.active_deque.get() = Some(new_active_deque);
-                        }
+                        *self.active_deque.borrow_mut() = Some(new_active_deque);
                     }
 
                     // No need to push popped job on to active deque, we would pop this job off in
@@ -1304,7 +1304,7 @@ impl WorkerThread {
         // remember to remove the corresponding stealer.
         // TODO: possible optimization where we don't free deques, but leave them allocated for
         // later use again (no idea if this would work).
-        if let Some(active_deque) = unsafe { &mut *self.active_deque.get() }.take() {
+        if let Some(active_deque) = self.active_deque.borrow_mut().take() {
             // Destroy current active deque stealable resources
             // TODO: deque stealable resources must be destroyed before the actual deque worker is
             // destroyed, to avoid threads trying to steal from this deque when it's worker no
@@ -1325,7 +1325,7 @@ impl WorkerThread {
             .expect("Could not find muggable deque in deque bench")
             .1;
         let popped_job = muggable_deque.pop();
-        *unsafe { &mut *self.active_deque.get() } = Some(muggable_deque);
+        *self.active_deque.borrow_mut() = Some(muggable_deque);
 
         popped_job
     }
@@ -1345,7 +1345,7 @@ unsafe fn main_loop(
     // the currently running thread (currently running thread stored in thread local
     // WORKER_THREAD_STATE)
     let worker_thread = &WorkerThread {
-        active_deque: UnsafeCell::new(Some(deque)),
+        active_deque: RefCell::new(Some(deque)),
         set_to_active_lock,
         fifo: JobFifo::new(),
         index,

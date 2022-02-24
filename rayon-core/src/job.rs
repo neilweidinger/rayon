@@ -5,7 +5,7 @@ use crate::registry::{
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
-use std::cell::UnsafeCell;
+use std::cell::RefCell;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
@@ -99,8 +99,8 @@ where
     R: Send,
 {
     pub(super) latch: L,
-    func: UnsafeCell<Option<F>>,
-    result: UnsafeCell<JobResult<R>>,
+    func: RefCell<Option<F>>,
+    result: RefCell<JobResult<R>>,
     worker_thread_index: Option<ThreadIndex>, // the worker thread index on which this job was created, None if this job was injected
 }
 
@@ -117,8 +117,8 @@ where
     ) -> StackJob<L, F, R> {
         StackJob {
             latch,
-            func: UnsafeCell::new(Some(func)),
-            result: UnsafeCell::new(JobResult::None),
+            func: RefCell::new(Some(func)),
+            result: RefCell::new(JobResult::None),
             worker_thread_index,
         }
     }
@@ -149,14 +149,14 @@ where
 
         let this = &*this;
         let abort = unwind::AbortIfPanic;
-        let func = (*this.func.get()).take().unwrap();
+        let func = this.func.borrow_mut().take().unwrap();
         let injected = if let Some(index) = this.worker_thread_index {
             index != context.worker_thread.index()
         } else {
             true
         };
 
-        (*this.result.get()) =
+        (*this.result.borrow_mut()) =
             // If the injected parameter we receive is true, then this job has definitely
             // been injected and we pass this to the function. Otherwise, we fall back to
             // whatever boolean value this job was created with: (*this).injected.
@@ -179,7 +179,7 @@ pub(super) struct HeapJob<BODY>
 where
     BODY: FnOnce() + Send,
 {
-    job: UnsafeCell<Option<BODY>>,
+    job: RefCell<Option<BODY>>,
 }
 
 impl<BODY> HeapJob<BODY>
@@ -188,7 +188,7 @@ where
 {
     pub(super) fn new(func: BODY) -> Self {
         HeapJob {
-            job: UnsafeCell::new(Some(func)),
+            job: RefCell::new(Some(func)),
         }
     }
 
@@ -207,7 +207,7 @@ where
 {
     unsafe fn execute(this: *const Self, _: ExecutionContext<'_>) {
         let this: Box<Self> = mem::transmute(this);
-        let job = (*this.job.get()).take().unwrap();
+        let job = this.job.borrow_mut().take().unwrap();
         job();
     }
 }
@@ -233,9 +233,9 @@ where
     F: Future,
 {
     pub(super) latch: L,
-    future: UnsafeCell<F>,
-    result: UnsafeCell<JobResult<F::Output>>,
-    waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here on stack to avoid heap allocation
+    future: RefCell<F>,
+    result: RefCell<JobResult<F::Output>>,
+    waker: RefCell<Option<FutureJobWaker>>, // store waker *data* here on stack to avoid heap allocation
 }
 
 impl<L, F> FutureJob<L, F>
@@ -246,9 +246,9 @@ where
     pub(super) fn new(future: F, latch: L) -> Self {
         Self {
             latch,
-            future: UnsafeCell::new(future),
-            result: UnsafeCell::new(JobResult::None),
-            waker: UnsafeCell::new(None),
+            future: RefCell::new(future),
+            result: RefCell::new(JobResult::None),
+            waker: RefCell::new(None),
         }
     }
 
@@ -358,7 +358,9 @@ where
         // Get the ID of the deque this FutureJob is in, since it may return pending and this deque
         // will become suspended, and the waker will need to know the ID of this deque in order to
         // mark it resumable
-        let suspended_deque_id = { &*worker_thread.active_deque().get() }
+        let suspended_deque_id = worker_thread
+            .active_deque()
+            .borrow()
             .as_ref()
             .expect("Worker thread executing a job erroneously has no active deque")
             .id();
@@ -373,24 +375,27 @@ where
         // even allowed, having new wakers for the same future)
 
         // Move future job waker data into this FutureJob so that it lives there
-        *this.waker.get() = Some(future_job_waker);
+        *this.waker.borrow_mut() = Some(future_job_waker);
         let future_job_waker_ptr =
-            { &*this.waker.get() }.as_ref().unwrap() as *const FutureJobWaker;
+            this.waker.borrow_mut().as_ref().unwrap() as *const FutureJobWaker;
         let waker = Waker::from_raw(RawWaker::new(
             future_job_waker_ptr as *const (),
             &FutureJobWaker::WAKER_VTABLE,
         ));
         let mut context = Context::from_waker(&waker);
-        let pinned_future = Pin::new_unchecked(&mut *this.future.get());
+        let r = &mut *this.future.borrow_mut();
+        let pinned_future = Pin::new_unchecked(r);
 
         let execute_poll = || match pinned_future.poll(&mut context) {
             Poll::Ready(x) => {
-                *(this.result.get()) = JobResult::Ok(x);
+                *(this.result.borrow_mut()) = JobResult::Ok(x);
                 this.latch.set();
             }
             Poll::Pending => {
                 // Set active deque for worker thread to None so that thread steals on next round
-                let active_deque = { &mut *worker_thread.active_deque().get() }
+                let active_deque = worker_thread
+                    .active_deque()
+                    .borrow_mut()
                     .take()
                     .expect("Worker thread executing a job erroneously has no active deque");
 
@@ -433,7 +438,7 @@ where
         };
 
         if let Err(panic) = unwind::halt_unwinding(execute_poll) {
-            *(this.result.get()) = JobResult::Panic(panic);
+            *(this.result.borrow_mut()) = JobResult::Panic(panic);
             this.latch.set();
         };
 
