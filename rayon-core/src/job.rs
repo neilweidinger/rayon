@@ -148,7 +148,6 @@ where
         }
 
         let this = &*this;
-        let abort = unwind::AbortIfPanic;
         let func = this.func.borrow_mut().take().unwrap();
         let injected = if let Some(index) = this.worker_thread_index {
             index != context.worker_thread.index()
@@ -165,7 +164,6 @@ where
                 Err(x) => JobResult::Panic(x),
             };
         this.latch.set();
-        mem::forget(abort);
     }
 }
 
@@ -350,7 +348,6 @@ where
 {
     unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
         let this = &*this;
-        let abort = unwind::AbortIfPanic;
 
         let worker_thread = execution_context.worker_thread;
         let stealables = execution_context.worker_thread.stealables();
@@ -441,8 +438,6 @@ where
             *(this.result.borrow_mut()) = JobResult::Panic(panic);
             this.latch.set();
         };
-
-        mem::forget(abort);
     }
 }
 

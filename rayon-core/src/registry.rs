@@ -366,15 +366,10 @@ impl Registry {
     pub(super) fn handle_panic(&self, err: Box<dyn Any + Send>) {
         match self.panic_handler {
             Some(ref handler) => {
-                // If the customizable panic handler itself panics,
-                // then we abort.
-                let abort_guard = unwind::AbortIfPanic;
                 handler(err);
-                mem::forget(abort_guard);
             }
             None => {
-                // Default panic handler aborts.
-                let _ = unwind::AbortIfPanic; // let this drop.
+                panic!("Default panic handler");
             }
         }
     }
@@ -1099,13 +1094,6 @@ impl WorkerThread {
 
     #[cold]
     fn wait_until_cold(&self, latch: &CoreLatch) {
-        // the code below should swallow all panics and hence never
-        // unwind; but if something does wrong, we want to abort,
-        // because otherwise other code in rayon may assume that the
-        // latch has been signaled, and that can lead to random memory
-        // accesses, which would be *very bad*
-        let abort_guard = unwind::AbortIfPanic;
-
         let mut idle_state = self.registry.sleep.start_looking(self.index, latch);
 
         // main scheduling loop takes place here!
@@ -1141,7 +1129,6 @@ impl WorkerThread {
             worker: self.index,
             latch_addr: latch.addr(),
         });
-        mem::forget(abort_guard); // successful execution, do not abort
     }
 
     #[inline]
@@ -1358,11 +1345,6 @@ unsafe fn main_loop(
     // let registry know we are ready to do work
     registry.thread_infos[index].primed.set();
 
-    // Worker threads should not panic. If they do, just abort, as the
-    // internal state of the threadpool is corrupted. Note that if
-    // **user code** panics, we should catch that and redirect.
-    let abort_guard = unwind::AbortIfPanic;
-
     // Inform a user callback that we started a thread.
     if let Some(ref handler) = registry.start_handler {
         let registry = registry.clone();
@@ -1386,9 +1368,6 @@ unsafe fn main_loop(
 
     // let registry know we are done
     registry.thread_infos[index].stopped.set();
-
-    // Normal termination, do not abort.
-    mem::forget(abort_guard);
 
     worker_thread.log(|| ThreadTerminate { worker: index });
 
