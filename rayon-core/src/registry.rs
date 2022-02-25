@@ -829,7 +829,7 @@ impl Stealables {
 
     /// Move a stealable deque from another random victim thread into this thread.
     fn rebalance_stealables(&self, thread_index: ThreadIndex) {
-        let victim_index = 0_usize; // TODO: actually make random
+        let victim_index = RNG.with(|rng| rng.next_usize(self.get_num_threads()));
 
         // No need to do anything if victim thread is same as this thread
         if thread_index == victim_index {
@@ -952,6 +952,7 @@ pub(super) struct WorkerThread {
 // for a RefCell<T> etc.
 thread_local! {
     static WORKER_THREAD_STATE: Cell<*const WorkerThread> = Cell::new(ptr::null());
+    static RNG: XorShift64Star = XorShift64Star::new();
 }
 
 impl Drop for WorkerThread {

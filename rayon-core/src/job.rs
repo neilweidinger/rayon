@@ -304,13 +304,11 @@ impl FutureJobWaker {
 
         // If deque not already in a stealable set, we must place it in some thread's stealable set.
         if stealable_set_index.is_none() {
-            RNG.with(|rng| {
-                let random_victim_index = rng.next_usize(stealables.get_num_threads());
+            let random_victim_index = RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
 
-                // Insert this ex-suspended and now resumable deque into a random victim's stealable set
-                // Corresponds to markSuspendedResumable(future.suspended) in ProWS line 39
-                stealables.add_deque_to_stealable_set(random_victim_index, self.suspended_deque_id);
-            });
+            // Insert this ex-suspended and now resumable deque into a random victim's stealable
+            // set Corresponds to markSuspendedResumable(future.suspended) in ProWS line 39
+            stealables.add_deque_to_stealable_set(random_victim_index, self.suspended_deque_id);
         }
     }
 
@@ -400,7 +398,8 @@ where
                 // If the deque contains non-suspended jobs, it still contains work and can be
                 // stolen from. As such add it to a random victim's stealable set.
                 if active_deque.len() > 0 {
-                    let random_victim_index = 0_usize; // TODO: make this actually random
+                    let random_victim_index =
+                        RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
                     stealables.add_deque_to_stealable_set(random_victim_index, active_deque.id());
                 }
 
