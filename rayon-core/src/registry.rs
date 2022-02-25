@@ -1145,15 +1145,15 @@ impl WorkerThread {
             let victim_thread = self.rng.next_usize(num_threads);
             let victim_deque_id = self.stealables.get_random_deque_id(victim_thread)?;
 
-            let (deque_stealer, deque_state, stealable_set_index) =
+            let (deque_stealer, deque_state, _stealable_set_index) =
                 self.stealables.get_deque_stealer_info(victim_deque_id)?;
-            let stealable_set_index = stealable_set_index?;
 
-            assert!(
-                stealable_set_index == victim_thread,
-                "The thread stealable set this victim deque is from did not match the stealable set
-                this victim deque is recorded to be in"
-            );
+            // There used to be an assert here asserting that stealable_set_index == victim_thread,
+            // but this is not quite accurate as another thread could have moved this victim deque
+            // to another stealable set in the meantime (e.g. when rebalancing). If this happens,
+            // it should not a problem since our mugging operation (set_to_active()) should just
+            // fail (i.e. we retry steal operation) if it cannot safely mug, and even if the deque
+            // moved to another stealable set it should be safe to simply steal off the top of it.
 
             // If muggable, mug entire deque and set as active deque for thread
             if deque_state == DequeState::Muggable {
@@ -1224,12 +1224,12 @@ impl WorkerThread {
         })
     }
 
-    /// This is only intended to be called from the steal procedure. Sets the victim deque to be
-    /// this worker thread's active deque. Pass in the victim thread index as well, since we need
-    /// to rebalance stealables and remove the deque from the victim thread stealable set, and move
-    /// it into this worker thread's stealable set. This method is ensured to be atomic by using a
-    /// lock, since we don't want threads trying to set the same muggable deque to be their active
-    /// deques.
+    /// This is only intended to be called from the steal procedure. Sets (i.e. mugs) the victim
+    /// deque to be this worker thread's active deque. Pass in the victim thread index as well,
+    /// since we need to rebalance stealables and remove the deque from the victim thread stealable
+    /// set, and move it into this worker thread's stealable set. This method is ensured to be
+    /// atomic by using a lock, since we don't want threads trying to set the same muggable deque
+    /// to be their active deques.
     fn set_to_active(
         &self,
         victim_deque_id: DequeId,
