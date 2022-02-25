@@ -1269,6 +1269,8 @@ impl WorkerThread {
         victim_thread: ThreadIndex,
     ) -> Option<JobRef> {
         // Enter protected atomic section
+        // TODO: we should probably have a lock around the actual worker thread active_deque field
+        // as oppposed to just making set_to_active atomic.
         let _guard = self.set_to_active_lock.lock();
 
         // We have entered the protected atomic section. It could be possible that another thread
