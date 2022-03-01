@@ -447,6 +447,10 @@ impl Registry {
             .new_injected_jobs(usize::MAX, injected_jobs.len() as u32, queue_was_empty);
     }
 
+    pub(super) fn wake_any_worker_thread(&self) {
+        self.sleep.new_injected_jobs(usize::MAX, 1, true); // TODO: not sure what we should use as queue_was_empty arg
+    }
+
     fn has_injected_job(&self) -> bool {
         !self.injected_jobs.is_empty()
     }

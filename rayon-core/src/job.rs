@@ -1,10 +1,9 @@
 use crate::latch::Latch;
 use crate::registry::{
-    Deque, DequeId, DequeState, Stealables, ThreadIndex, WorkerThread, XorShift64Star,
+    DequeId, DequeState, Registry, Stealables, ThreadIndex, WorkerThread, XorShift64Star,
 };
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
-use dashmap::DashMap;
 use std::any::Any;
 use std::cell::UnsafeCell;
 use std::future::Future;
@@ -270,7 +269,7 @@ thread_local! {
 #[derive(Clone)]
 struct FutureJobWaker {
     stealables: *const Arc<Stealables>, // TODO: raw pointer to hide lifetime, this is just to avoid performance penalty of ref counting, is this really necessary
-    deque_bench: *const DashMap<DequeId, Deque>, // TODO: raw pointer also to hide lifetime and avoid refcounts (although deque_bench isn't Arc'd to begin with)
+    registry: *const Arc<Registry>, // TODO: raw pointer also to hide lifetime and avoid refcounts, is this really necessary
     suspended_deque_id: DequeId,
     suspended_job_ref: JobRef,
 }
@@ -282,21 +281,24 @@ impl FutureJobWaker {
         let stealables = unsafe { &*self.stealables };
         let (_, deque_state, stealable_set_index) = stealables
             .get_deque_stealer_info(self.suspended_deque_id)
-            .expect("Stealer for suspended deque not found");
+            .expect("Stealer info for suspended deque not found");
 
         assert!(
             deque_state == DequeState::Suspended,
             "Future triggered waker, but deque this future belongs to was not marked as suspended"
         );
 
+        let registry = unsafe { &*self.registry };
+
         // This future was woken up, so push the ex-suspended and now non-suspended future JobRef
         // back onto the deque, so that another thread can steal it. Pushing the JobRef onto the
         // deque here when the future wakes up, as opposed to proactively pushing it when the
         // blocked future is first encountered, ensures that a deque only ever contains
         // non-suspended jobs, which simplifies the stealing implemenrtation.
-        let deque_worker = &mut *(unsafe { &*self.deque_bench }
+        let deque_worker = registry
+            .deque_bench()
             .get_mut(&self.suspended_deque_id)
-            .expect("Suspended deque not found in deque bench"));
+            .expect("Suspended deque not found in deque bench");
         deque_worker.push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
@@ -310,6 +312,11 @@ impl FutureJobWaker {
             // set Corresponds to markSuspendedResumable(future.suspended) in ProWS line 39
             stealables.add_deque_to_stealable_set(random_victim_index, self.suspended_deque_id);
         }
+
+        // Signal threads to wake up (it could be the case that all worker threads are sleeping,
+        // and if we don't explictly signal a thread to wake up this job will never get polled
+        // again)
+        registry.wake_any_worker_thread();
     }
 
     const WAKER_VTABLE: RawWakerVTable = RawWakerVTable::new(
@@ -358,9 +365,12 @@ where
         let future_job_waker = FutureJobWaker {
             stealables,
             suspended_deque_id,
-            deque_bench: worker_thread.registry().deque_bench(),
+            registry: worker_thread.registry(),
             suspended_job_ref: execution_context.job_ref,
         };
+
+        // TODO: a new waker is created everytime a future is polled, can we avoid this (or is this
+        // even allowed, having new wakers for the same future)
 
         // Move future job waker data into this FutureJob so that it lives there
         *this.waker.get() = Some(future_job_waker);
