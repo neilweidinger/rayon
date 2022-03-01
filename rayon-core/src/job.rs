@@ -389,7 +389,7 @@ where
                 // jobs. If it does not and only contains the one suspended job, this deque will
                 // not be found in any stealable set and as such will not be able to be stolen
                 // from.
-                stealables
+                let _ = stealables
                     .remove_deque_from_stealable_set(worker_thread.index(), active_deque.id());
 
                 // Mark deque as suspended

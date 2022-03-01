@@ -176,12 +176,14 @@ where
     registry::in_worker(|worker_thread, _| unsafe {
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
+        // TODO: make pinning on stack more explicit using something like pin_mut! or something
         let job_b = FutureJob::new(future_b, SpinLatch::new(worker_thread));
         let job_b_ref = job_b.as_job_ref();
         worker_thread.push(job_b_ref);
 
         // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
         // Future gets moved into above mentioned job and lives there.
+        // TODO: make pinning on stack more explicit using something like pin_mut! or something
         let job_a = FutureJob::new(future_a, SpinLatch::new(worker_thread));
         let job_a_ref = job_a.as_job_ref();
         worker_thread.push(job_a_ref);
