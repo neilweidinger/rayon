@@ -71,7 +71,7 @@ pub(super) struct CoreLatch {
 
 impl CoreLatch {
     #[inline]
-    fn new() -> Self {
+    pub(super) fn new() -> Self {
         Self {
             state: AtomicUsize::new(0),
         }
@@ -123,7 +123,7 @@ impl CoreLatch {
     /// doing some wakeups; those are encapsulated in the surrounding
     /// latch code.
     #[inline]
-    fn set(&self) -> bool {
+    pub(super) fn set(&self) -> bool {
         let old_state = self.state.swap(SET, Ordering::AcqRel);
         old_state == SLEEPING
     }

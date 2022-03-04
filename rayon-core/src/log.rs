@@ -18,6 +18,7 @@
 //!   many workers are active at a given time
 //! * `all:<file>` -- dumps every event to the file; useful for debugging
 
+use crate::registry::{DequeId, DequeState, ThreadIndex};
 use crossbeam_channel::{self, Receiver, Sender};
 use std::collections::VecDeque;
 use std::env;
@@ -39,59 +40,178 @@ pub(super) enum Event {
     },
 
     /// Indicates that a worker thread terminated execution.
-    ThreadTerminate { worker: usize },
+    ThreadTerminate {
+        worker: usize,
+    },
 
     /// Indicates that a worker thread became idle, blocked on `latch_addr`.
-    ThreadIdle { worker: usize, latch_addr: usize },
+    ThreadIdle {
+        worker: usize,
+        latch_addr: usize,
+    },
 
     /// Indicates that an idle worker thread found work to do, after
     /// yield rounds. It should no longer be considered idle.
-    ThreadFoundWork { worker: usize, yields: u32 },
+    ThreadFoundWork {
+        worker: usize,
+        yields: u32,
+    },
 
     /// Indicates that a worker blocked on a latch observed that it was set.
     ///
     /// Internal debugging event that does not affect the state
     /// machine.
-    ThreadSawLatchSet { worker: usize, latch_addr: usize },
+    ThreadSawLatchSet {
+        worker: usize,
+        latch_addr: usize,
+    },
 
     /// Indicates that an idle worker is getting sleepy. `sleepy_counter` is the internal
     /// sleep state that we saw at the time.
-    ThreadSleepy { worker: usize, jobs_counter: usize },
+    ThreadSleepy {
+        worker: usize,
+        jobs_counter: usize,
+    },
 
     /// Indicates that the thread's attempt to fall asleep was
     /// interrupted because the latch was set. (This is not, in and of
     /// itself, a change to the thread state.)
-    ThreadSleepInterruptedByLatch { worker: usize, latch_addr: usize },
+    ThreadSleepInterruptedByLatch {
+        worker: usize,
+        latch_addr: usize,
+    },
 
     /// Indicates that the thread's attempt to fall asleep was
     /// interrupted because a job was posted. (This is not, in and of
     /// itself, a change to the thread state.)
-    ThreadSleepInterruptedByJob { worker: usize },
+    ThreadSleepInterruptedByJob {
+        worker: usize,
+    },
 
     /// Indicates that an idle worker has gone to sleep.
-    ThreadSleeping { worker: usize, latch_addr: usize },
+    ThreadSleeping {
+        worker: usize,
+        latch_addr: usize,
+    },
 
     /// Indicates that a sleeping worker has awoken.
-    ThreadAwoken { worker: usize, latch_addr: usize },
+    ThreadAwoken {
+        worker: usize,
+        latch_addr: usize,
+    },
 
     /// Indicates that the given worker thread was notified it should
     /// awaken.
-    ThreadNotify { worker: usize },
+    ThreadNotify {
+        worker: usize,
+    },
+
+    /// Indicates that a waker was triggered
+    /// suspended_deque_id: deque that was suspended and now resumable
+    /// stealable_set_index: stealable set the deque was already in
+    WakerAwoken {
+        suspended_deque_id: DequeId,
+        stealable_set_index: usize,
+    },
+
+    /// Indicates that a waker was triggered, and the deque was added to a stealable set (as
+    /// opposed to already being in one).
+    /// suspended_deque_id: deque that was suspended and now resumable
+    /// stealable_set_index: stealable set the deque was added to
+    WakerAwokenAndDequeInserted {
+        suspended_deque_id: DequeId,
+        stealable_set_index: usize,
+    },
+
+    /// Indicates that a FutureJob was executed and returned Poll::Ready.
+    FutureJobReady {
+        deque_id: DequeId,
+        executing_worker_thread: ThreadIndex,
+    },
+
+    /// Indicates that a FutureJob was executed but returned Poll::Pending.
+    FutureJobPending {
+        deque_id: DequeId,
+        executing_worker_thread: ThreadIndex,
+    },
 
     /// The given worker has pushed a job to its local deque.
-    JobPushed { worker: usize },
+    JobPushed {
+        worker: usize,
+        deque_id: DequeId,
+    },
 
     /// The given worker has popped a job from its local deque.
-    JobPopped { worker: usize },
+    JobPopped {
+        worker: usize,
+        deque_id: DequeId,
+    },
 
-    /// The given worker has stolen a job from the deque of another.
-    JobStolen { worker: usize, victim: usize },
+    /// The given worker has successfully stolen a job from the deque of another.
+    JobStolen {
+        attempt: i32,
+        worker: usize,
+        victim_thread: usize,
+        victim_deque_id: DequeId,
+    },
+
+    /// The given worker attempted to steal a job, but failed.
+    JobStolenFail {
+        attempt: i32,
+        worker: usize,
+        victim_thread: usize,
+        victim_deque_id: DequeId,
+    },
+
+    NewDequeAddedToStealableSet {
+        stealable_set_index: usize,
+        deque_id: DequeId,
+    },
+
+    ExistingDequeAddedToStealableSet {
+        stealable_set_index: usize,
+        deque_id: DequeId,
+    },
+
+    DequeRemovedFromStealableSet {
+        stealable_set_index: usize,
+        deque_id: DequeId,
+    },
+
+    DequeRemovedFromStealableSetFailed {
+        stealable_set_index: usize,
+        deque_id: DequeId,
+    },
+
+    DequeRemovedFromStealableSetNotPerfomed {
+        deque_id: DequeId,
+    },
+
+    RebalanceStealables {
+        attempt: i32,
+        thread_index: usize,
+        victim_index: usize,
+    },
+
+    HandlingEmptyDeque {
+        deque_id: DequeId,
+        deque_state: DequeState,
+    },
+
+    HandlingEmptyDequeNotEmpty {
+        deque_id: DequeId,
+        deque_state: DequeState,
+    },
 
     /// N jobs were injected into the global queue.
-    JobsInjected { count: usize },
+    JobsInjected {
+        count: usize,
+    },
 
     /// A job was removed from the global queue.
-    JobUninjected { worker: usize },
+    JobUninjected {
+        worker: usize,
+    },
 
     /// When announcing a job, this was the value of the counters we observed.
     ///
@@ -293,7 +413,6 @@ impl State {
 }
 
 struct SimulatorState {
-    local_queue_size: Vec<usize>,
     thread_states: Vec<State>,
     injector_size: usize,
 }
@@ -301,7 +420,6 @@ struct SimulatorState {
 impl SimulatorState {
     fn new(num_workers: usize) -> Self {
         Self {
-            local_queue_size: vec![0; num_workers],
             thread_states: vec![State::Working; num_workers],
             injector_size: 0,
         }
@@ -334,21 +452,6 @@ impl SimulatorState {
             Event::ThreadAwoken { worker, .. } => {
                 assert_eq!(self.thread_states[worker], State::Notified);
                 self.thread_states[worker] = State::Idle;
-                true
-            }
-
-            Event::JobPushed { worker } => {
-                self.local_queue_size[worker] += 1;
-                true
-            }
-
-            Event::JobPopped { worker } => {
-                self.local_queue_size[worker] -= 1;
-                true
-            }
-
-            Event::JobStolen { victim, .. } => {
-                self.local_queue_size[victim] -= 1;
                 true
             }
 
@@ -396,25 +499,17 @@ impl SimulatorState {
             .filter(|s| **s == State::Notified)
             .count();
 
-        let num_pending_jobs: usize = self.local_queue_size.iter().sum();
-
         write!(w, "{:2},", num_idle_threads)?;
         write!(w, "{:2},", num_sleeping_threads)?;
         write!(w, "{:2},", num_notified_threads)?;
-        write!(w, "{:4},", num_pending_jobs)?;
         write!(w, "{:4},", self.injector_size)?;
 
         let event_str = format!("{:?}", event);
         write!(w, r#""{:60}","#, event_str)?;
 
-        for ((i, state), queue_size) in (0..).zip(&self.thread_states).zip(&self.local_queue_size) {
+        for (i, state) in (0..).zip(&self.thread_states) {
             write!(w, " T{:02},{}", i, state.letter(),)?;
-
-            if *queue_size > 0 {
-                write!(w, ",{:03},", queue_size)?;
-            } else {
-                write!(w, ",   ,")?;
-            }
+            write!(w, ",   ,")?;
         }
 
         write!(w, "\n")?;

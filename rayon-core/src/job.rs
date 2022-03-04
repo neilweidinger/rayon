@@ -1,4 +1,6 @@
+use crate::latch::CoreLatch;
 use crate::latch::Latch;
+use crate::log::Event;
 use crate::registry::{
     DequeId, DequeState, Registry, Stealables, ThreadIndex, WorkerThread, XorShift64Star,
 };
@@ -150,20 +152,20 @@ where
         let this = &*this;
         let abort = unwind::AbortIfPanic;
         let func = (*this.func.get()).take().unwrap();
+        // If this StackJob was not created by a worker thread (indicated by the None type), then
+        // we definitely know this job has been injected. Otherwise, if the thread that is
+        // executing this job is different from the thread that created it, then we also know the
+        // job has been injected.
         let injected = if let Some(index) = this.worker_thread_index {
             index != context.worker_thread.index()
         } else {
             true
         };
 
-        (*this.result.get()) =
-            // If the injected parameter we receive is true, then this job has definitely
-            // been injected and we pass this to the function. Otherwise, we fall back to
-            // whatever boolean value this job was created with: (*this).injected.
-            match unwind::halt_unwinding(call(func, injected)) {
-                Ok(x) => JobResult::Ok(x),
-                Err(x) => JobResult::Panic(x),
-            };
+        (*this.result.get()) = match unwind::halt_unwinding(call(func, injected)) {
+            Ok(x) => JobResult::Ok(x),
+            Err(x) => JobResult::Panic(x),
+        };
         this.latch.set();
         mem::forget(abort);
     }
@@ -266,22 +268,28 @@ thread_local! {
                                                         // creation, is optimization really necessary?
 }
 
-#[derive(Clone)]
 struct FutureJobWaker {
     stealables: *const Arc<Stealables>, // TODO: raw pointer to hide lifetime, this is just to avoid performance penalty of ref counting, is this really necessary
     registry: *const Arc<Registry>, // TODO: raw pointer also to hide lifetime and avoid refcounts, is this really necessary
     suspended_deque_id: DequeId,
     suspended_job_ref: JobRef,
+    latch: CoreLatch,
 }
 
 impl FutureJobWaker {
     fn wake_by_ref(&self) {
+        let stealables = unsafe { &*self.stealables };
+
+        // Wait here until worker thread has completed blocked future logic (marking deque as
+        // Suspended, moving it to the bench, etc.)
+        while !self.latch.probe() {}
+
         // Get the current (and soon to be replaced) state of the deque. Use this to later check if
         // deque needs to be moved into a stealable set or not.
-        let stealables = unsafe { &*self.stealables };
-        let (_, deque_state, stealable_set_index) = stealables
-            .get_deque_stealer_info(self.suspended_deque_id)
-            .expect("Stealer info for suspended deque not found");
+        let mut lock = stealables
+            .get_lock(self.suspended_deque_id)
+            .expect("Deque ID should have been in stealables mapping, but was not found");
+        let (_, deque_state, stealable_set_index) = *lock.value_mut();
 
         assert!(
             deque_state == DequeState::Suspended,
@@ -298,24 +306,50 @@ impl FutureJobWaker {
         let deque_worker = registry
             .deque_bench()
             .get_mut(&self.suspended_deque_id)
-            .expect("Suspended deque not found in deque bench");
+            .expect(
+                format!(
+                    "Suspended deque {:?} not found in deque bench",
+                    self.suspended_deque_id
+                )
+                .as_str(),
+            );
         deque_worker.push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
-        stealables.update_deque_state(self.suspended_deque_id, DequeState::Resumable);
+        stealables.update_deque_state(
+            Some(&mut lock),
+            self.suspended_deque_id,
+            DequeState::Resumable,
+        );
 
         // If deque not already in a stealable set, we must place it in some thread's stealable set.
         if stealable_set_index.is_none() {
             let random_victim_index = RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
 
+            registry.log(|| Event::WakerAwokenAndDequeInserted {
+                suspended_deque_id: self.suspended_deque_id,
+                stealable_set_index: random_victim_index,
+            });
+
             // Insert this ex-suspended and now resumable deque into a random victim's stealable
             // set Corresponds to markSuspendedResumable(future.suspended) in ProWS line 39
-            stealables.add_deque_to_stealable_set(random_victim_index, self.suspended_deque_id);
+            stealables.add_existing_deque_to_stealable_set(
+                Some(&mut lock),
+                random_victim_index,
+                self.suspended_deque_id,
+            );
+        } else {
+            registry.log(|| Event::WakerAwoken {
+                suspended_deque_id: self.suspended_deque_id,
+                stealable_set_index: stealable_set_index.expect("I will go crazy if this panics"),
+            });
         }
 
         // Signal threads to wake up (it could be the case that all worker threads are sleeping,
         // and if we don't explictly signal a thread to wake up this job will never get polled
         // again)
+        // TODO: this will awaken threads, but there is no guarantee that this specific Resumable
+        // deque will be chosen and this JobRef be stolen
         registry.wake_any_worker_thread();
     }
 
@@ -358,15 +392,16 @@ where
         // Get the ID of the deque this FutureJob is in, since it may return pending and this deque
         // will become suspended, and the waker will need to know the ID of this deque in order to
         // mark it resumable
-        let suspended_deque_id = { &*worker_thread.active_deque().get() }
+        let deque_id = { &*worker_thread.active_deque().get() }
             .as_ref()
             .expect("Worker thread executing a job erroneously has no active deque")
             .id();
         let future_job_waker = FutureJobWaker {
             stealables,
-            suspended_deque_id,
+            suspended_deque_id: deque_id,
             registry: worker_thread.registry(),
             suspended_job_ref: execution_context.job_ref,
+            latch: CoreLatch::new(),
         };
 
         // TODO: a new waker is created everytime a future is polled, can we avoid this (or is this
@@ -385,50 +420,66 @@ where
 
         let execute_poll = || match pinned_future.poll(&mut context) {
             Poll::Ready(x) => {
+                worker_thread.registry().log(|| Event::FutureJobReady {
+                    deque_id,
+                    executing_worker_thread: worker_thread.index(),
+                });
+
                 *(this.result.get()) = JobResult::Ok(x);
                 this.latch.set();
             }
             Poll::Pending => {
+                worker_thread.registry().log(|| Event::FutureJobPending {
+                    deque_id,
+                    executing_worker_thread: worker_thread.index(),
+                });
+
                 // Set active deque for worker thread to None so that thread steals on next round
                 let active_deque = { &mut *worker_thread.active_deque().get() }
                     .take()
                     .expect("Worker thread executing a job erroneously has no active deque");
 
-                // Remove deque from stealable set to prevent being stolen from; we will add to
-                // another threads stealable set if we see the deque contains other non-suspended
-                // jobs. If it does not and only contains the one suspended job, this deque will
-                // not be found in any stealable set and as such will not be able to be stolen
-                // from.
-                let _ = stealables
-                    .remove_deque_from_stealable_set(worker_thread.index(), active_deque.id());
-
                 // Mark deque as suspended
-                stealables.update_deque_state(active_deque.id(), DequeState::Suspended);
+                // TODO: get Stealables lock for here and other operations below?
+                stealables.update_deque_state(None, active_deque.id(), DequeState::Suspended);
+
+                // Remove deque from stealable set to prevent being stolen from; we will add to a
+                // random stealable set if we see the deque contains other non-suspended jobs. If
+                // it does not, and contains only the one suspended job, this deque will not be
+                // found in any stealable set and as such will not be able to be stolen from.
+                // TODO: check for removal failure?
+                let _ = stealables.remove_deque_from_stealable_set(None, active_deque.id());
 
                 // If the deque contains non-suspended jobs, it still contains work and can be
-                // stolen from. As such add it to a random victim's stealable set.
+                // stolen from. As such add it to a random victim's stealable set (random victim
+                // for rebalancing).
                 if active_deque.len() > 0 {
                     let random_victim_index =
                         RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
-                    stealables.add_deque_to_stealable_set(random_victim_index, active_deque.id());
+
+                    stealables.add_existing_deque_to_stealable_set(
+                        None,
+                        random_victim_index,
+                        active_deque.id(),
+                    );
                 }
 
                 // Move ex-active deque to the bench, so that it can live somewhere (the deque must
                 // not be dropped, since it will be resumed again later when the future completes).
                 // There should not already be a deque with the same ID in the bench, if so panic.
-                let deque_id_already_existed = worker_thread
-                    .registry()
-                    .deque_bench()
-                    .insert(active_deque.id(), active_deque);
                 assert!(
-                    deque_id_already_existed.is_none(),
+                    worker_thread
+                        .registry()
+                        .deque_bench()
+                        .insert(active_deque.id(), active_deque)
+                        .is_none(),
                     "When moving active deque to bench, bench already contained a deque with the
                     same ID"
                 );
 
-                // TODO: should we put some sort of latch here that waker needs to wait on before
-                // actually performing waking logic? So that deque suspension etc. guaranteed to
-                // happen first
+                // Only once we reach here and all the above blocked future logic is completed is
+                // the waker allowed to proceed
+                CoreLatch::set(&(*future_job_waker_ptr).latch);
             }
         };
 
