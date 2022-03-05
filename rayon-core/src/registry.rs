@@ -647,7 +647,6 @@ unsafe fn main_loop(
         set_to_active_lock,
         JobFifo::new(),
         index,
-        XorShift64Star::new(),
         registry.clone(),
     );
     WorkerThread::set_current(worker_thread);

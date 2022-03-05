@@ -373,9 +373,8 @@ impl Stealables {
                             thread_index,
                             stealable_deque_id,
                         );
-                    } else {
-                        // We need to make sure rebalancing doesn't move worker active deques
-                        return Err(());
+
+                        return Ok(());
                     }
                 } else if let Some(mut lock) = self.get_lock(stealable_deque_id) {
                     let deque_state = lock.value().1;
@@ -388,18 +387,15 @@ impl Stealables {
                             thread_index,
                             stealable_deque_id,
                         );
-                    } else {
-                        // We need to make sure rebalancing doesn't move worker active deques
-                        return Err(());
-                    }
-                } else {
-                    return Err(());
-                }
 
-                Ok(())
-            } else {
-                Err(())
+                        return Ok(());
+                    }
+                }
             }
+
+            // This case can occur if rebalancing accidentally tries to move an active deque,
+            // rebalancing couldn't get a lock, or rebalancing couldn't get a random deque ID
+            Err(())
         };
 
         let rebalance_attempts = 5; // TODO: totally arbitrary, find a better cap
@@ -486,8 +482,8 @@ impl<'a> FromIterator<&'a Deque> for Stealables {
 
 /// Basically contains a set of stealable deque IDs
 struct StealableSet {
-    stealable_deque_ids: Mutex<(HashMap<DequeId, usize>, Vec<DequeId>, XorShift64Star)>, // TODO: maybe use RwLock?
-    index: ThreadIndex, // Just used for debugging
+    stealable_deque_ids: Mutex<(HashMap<DequeId, usize>, Vec<DequeId>)>, // TODO: maybe use RwLock?
+    index: ThreadIndex,                                                  // Just used for debugging
 }
 
 impl StealableSet {
@@ -495,7 +491,7 @@ impl StealableSet {
     /// ID's
     #[must_use]
     fn get_random_deque_id(&self) -> Option<DequeId> {
-        let (_, v, rng) = &*self.stealable_deque_ids.lock().unwrap();
+        let (_, v) = &*self.stealable_deque_ids.lock().unwrap();
 
         // eprintln!(
         //     "stealable_set_index: {} getting random deque: {:?}",
@@ -506,12 +502,12 @@ impl StealableSet {
             return None;
         }
 
-        let random_index = rng.next_usize(v.len());
+        let random_index = RNG.with(|rng| rng.next_usize(v.len()));
         Some(v[random_index])
     }
 
     fn add_deque(&self, deque_id: DequeId) {
-        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
+        let (map, v) = &mut *self.stealable_deque_ids.lock().unwrap();
 
         assert!(
             !map.contains_key(&deque_id),
@@ -523,7 +519,7 @@ impl StealableSet {
     }
 
     fn remove_deque(&self, deque_id: DequeId) -> Outcome {
-        let (map, v, _) = &mut *self.stealable_deque_ids.lock().unwrap();
+        let (map, v) = &mut *self.stealable_deque_ids.lock().unwrap();
 
         // Bail early if deque no longer in stealable set. This can happen if another thread beats
         // this thread in removing it, e.g. when rebalancing or stealing.
@@ -557,7 +553,7 @@ impl FromIterator<DequeId> for StealableSet {
         }
 
         Self {
-            stealable_deque_ids: Mutex::new((map, v, XorShift64Star::new())),
+            stealable_deque_ids: Mutex::new((map, v)),
             index: 0,
         }
     }

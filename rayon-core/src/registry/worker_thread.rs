@@ -9,6 +9,10 @@ use std::cell::{Cell, UnsafeCell};
 use std::ptr;
 use std::sync::{Arc, Mutex};
 
+thread_local! {
+    static RNG: XorShift64Star = XorShift64Star::new();
+}
+
 pub(crate) struct WorkerThread {
     /// A worker thread owns its active deque, but all other deques (including a workers stealable
     /// deques) are stored on the bench (owned by the registry). The alternative would be to hold a
@@ -22,9 +26,6 @@ pub(crate) struct WorkerThread {
     fifo: JobFifo,
 
     index: ThreadIndex,
-
-    /// A weak random number generator.
-    rng: XorShift64Star,
 
     registry: Arc<Registry>,
 }
@@ -55,7 +56,6 @@ impl WorkerThread {
         set_to_active_lock: Arc<Mutex<()>>,
         fifo: JobFifo,
         index: ThreadIndex,
-        rng: XorShift64Star,
         registry: Arc<Registry>,
     ) -> Self {
         Self {
@@ -64,7 +64,6 @@ impl WorkerThread {
             set_to_active_lock,
             fifo,
             index,
-            rng,
             registry,
         }
     }
@@ -254,7 +253,7 @@ impl WorkerThread {
         // stealable (or no longer stealable, if another thread has changed the deque state), and
         // in these cases we just retry the steal procedure.
         (0..steal_attempts).find_map(|i| -> Option<JobRef> {
-            let victim_thread = self.rng.next_usize(num_threads);
+            let victim_thread = RNG.with(|rng| rng.next_usize(num_threads));
             let victim_deque_id = self.stealables.get_random_deque_id(victim_thread)?;
 
             let (deque_stealer, deque_state, _) =
