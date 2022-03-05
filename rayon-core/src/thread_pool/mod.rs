@@ -4,7 +4,8 @@
 //! [`ThreadPool`]: struct.ThreadPool.html
 
 use crate::join;
-use crate::registry::{Registry, ThreadSpawn, WorkerThread};
+use crate::registry::worker_thread::WorkerThread;
+use crate::registry::{Registry, ThreadSpawn};
 use crate::scope::{do_in_place_scope, do_in_place_scope_fifo};
 use crate::spawn;
 #[allow(deprecated)]

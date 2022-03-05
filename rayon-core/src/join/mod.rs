@@ -1,6 +1,7 @@
 use crate::job::{FutureJob, StackJob};
 use crate::latch::SpinLatch;
-use crate::registry::{self, WorkerThread};
+use crate::registry;
+use crate::registry::worker_thread::WorkerThread;
 use crate::unwind;
 use std::any::Any;
 use std::future::Future;

@@ -2,7 +2,8 @@ use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Condvar, Mutex};
 use std::usize;
 
-use crate::registry::{Registry, WorkerThread};
+use crate::registry::worker_thread::WorkerThread;
+use crate::registry::Registry;
 
 /// We define various kinds of latches, which are all a primitive signaling
 /// mechanism. A latch starts as false. Eventually someone calls `set()` and

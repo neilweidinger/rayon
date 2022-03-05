@@ -7,7 +7,8 @@
 
 use crate::job::{HeapJob, JobFifo};
 use crate::latch::{CountLatch, CountLockLatch, Latch};
-use crate::registry::{global_registry, in_worker, Registry, WorkerThread};
+use crate::registry::worker_thread::WorkerThread;
+use crate::registry::{global_registry, in_worker, Registry};
 use crate::unwind;
 use std::any::Any;
 use std::fmt;
