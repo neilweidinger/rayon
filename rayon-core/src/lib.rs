@@ -63,6 +63,7 @@ mod log;
 #[macro_use]
 mod private;
 
+mod deque;
 mod job;
 mod join;
 mod latch;

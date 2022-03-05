@@ -18,7 +18,7 @@
 //!   many workers are active at a given time
 //! * `all:<file>` -- dumps every event to the file; useful for debugging
 
-use crate::registry::{DequeId, DequeState, ThreadIndex};
+use crate::deque::{DequeId, DequeState, ThreadIndex};
 use crossbeam_channel::{self, Receiver, Sender};
 use std::collections::VecDeque;
 use std::env;

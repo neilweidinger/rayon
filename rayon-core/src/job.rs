@@ -1,9 +1,8 @@
+use crate::deque::{DequeId, DequeState, Stealables, ThreadIndex};
 use crate::latch::CoreLatch;
 use crate::latch::Latch;
 use crate::log::Event;
-use crate::registry::{
-    DequeId, DequeState, Registry, Stealables, ThreadIndex, WorkerThread, XorShift64Star,
-};
+use crate::registry::{Registry, WorkerThread, XorShift64Star};
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
