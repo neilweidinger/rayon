@@ -242,11 +242,11 @@ impl WorkerThread {
             return None;
         }
 
-        let steal_attempts = 10; // TODO: totally arbitrary cap on steal attempts, find a way to find a
-                                 // better cap. We need a cap since at some point we need to give
-                                 // up on stealing and check the global injector queue, and
-                                 // possible let this thread go to sleep if it really can't find
-                                 // anything.
+        let steal_attempts = 3; // TODO: totally arbitrary cap on steal attempts, find a way to find a
+                                // better cap. We need a cap since at some point we need to give
+                                // up on stealing and check the global injector queue, and
+                                // possible let this thread go to sleep if it really can't find
+                                // anything.
 
         // Attempt steal procedure steal_attempts times.
         // Any use of the question mark error propogation operator means that a deque is not
@@ -328,8 +328,6 @@ impl WorkerThread {
                     // the next scheduling round anyway so just return it directly here
                     Some(job)
                 }
-                // TODO: I'm not really sure what we should do here when the crossbeam stealer
-                // returns Retry, for now I think we should just retry stealing procedure
                 Steal::Empty | Steal::Retry => {
                     self.log(|| JobStolenFail {
                         attempt: i,
@@ -356,7 +354,6 @@ impl WorkerThread {
         victim_thread: ThreadIndex,
     ) -> Option<JobRef> {
         // Enter protected atomic section
-        // TODO: should we get a Stealables lock instead here
         let _guard = self.set_to_active_lock.lock();
 
         // We have entered the protected atomic section. It could be possible that another thread

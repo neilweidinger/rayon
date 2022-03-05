@@ -104,8 +104,7 @@ where
         move |_| f()
     }
 
-    // join_context(call(oper_a), call(oper_b)) // TODO: change this back
-    join_async(async { oper_a() }, async { oper_b() })
+    join_context(call(oper_a), call(oper_b))
 }
 
 /// Identical to `join`, except that the closures have a parameter

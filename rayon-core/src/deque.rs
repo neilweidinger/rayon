@@ -91,14 +91,15 @@ impl DerefMut for Deque {
     }
 }
 
-// TODO: absolutely need to make sure this is safe. An alternative could be to wrap a Deque in an
-// AtomicCell, but this would have performance overheads.
+// Although very scary, this should be safe since a crossbeam Worker should only be interacted with
+// by one thread at a time (Deque's are stored in the deque bench where they are not touched, and
+// only when a worker thread has ownership of a Deque as its current active deque is the crossbeam
+// Worker interacted with)
 unsafe impl Sync for Deque {}
 
 pub(super) type ThreadIndex = usize;
 pub(super) type StealablesLock<'a> =
     RefMut<'a, DequeId, (Stealer<JobRef>, DequeState, Option<ThreadIndex>)>;
-type Outcome = Result<(), ()>;
 
 pub(super) struct Stealables {
     stealable_sets: Vec<StealableSet>,
@@ -120,6 +121,13 @@ impl Stealables {
         self.registry = Some(registry);
     }
 
+    /// This returns a reference to an entry in the DashMap. The idea is that by holding a mutable
+    /// reference to an entry in the DashMap, we can be ensured that any mutations to this entry
+    /// will be atomic for the duration we hold the reference. This is pretty hacky but seems to
+    /// work. Note that you should not use this to enforce critical sections (mutual exclusion in a
+    /// code path), as holding a reference only guarantees that mutations to the entry are atomic,
+    /// and does not necessarily imply mutual exclusion of an arbitrary code path (case in point,
+    /// the mutex we hold in [`WorkerThread::set_to_active`]).
     #[must_use]
     #[inline]
     pub(super) fn get_lock(&self, deque_id: DequeId) -> Option<StealablesLock<'_>> {
@@ -341,7 +349,7 @@ impl Stealables {
         mut lock: Option<&mut StealablesLock<'a>>,
         thread_index: ThreadIndex,
     ) {
-        let mut rebalance_closure = |attempt| -> Outcome {
+        let mut rebalance_closure = |attempt| -> Result<(), ()> {
             let victim_index = RNG.with(|rng| rng.next_usize(self.get_num_threads()));
 
             self.registry.as_ref().unwrap().log(|| RebalanceStealables {
@@ -398,7 +406,7 @@ impl Stealables {
             Err(())
         };
 
-        let rebalance_attempts = 5; // TODO: totally arbitrary, find a better cap
+        let rebalance_attempts = 3; // TODO: totally arbitrary, find a better cap
 
         for i in 0..rebalance_attempts {
             if let Ok(_) = rebalance_closure(i) {
@@ -518,7 +526,7 @@ impl StealableSet {
         map.insert(deque_id, v.len() - 1);
     }
 
-    fn remove_deque(&self, deque_id: DequeId) -> Outcome {
+    fn remove_deque(&self, deque_id: DequeId) -> Result<(), ()> {
         let (map, v) = &mut *self.stealable_deque_ids.lock().unwrap();
 
         // Bail early if deque no longer in stealable set. This can happen if another thread beats

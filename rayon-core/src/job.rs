@@ -447,7 +447,6 @@ where
                 // random stealable set if we see the deque contains other non-suspended jobs. If
                 // it does not, and contains only the one suspended job, this deque will not be
                 // found in any stealable set and as such will not be able to be stolen from.
-                // TODO: check for removal failure?
                 let _ = stealables.remove_deque_from_stealable_set(None, active_deque.id());
 
                 // If the deque contains non-suspended jobs, it still contains work and can be
