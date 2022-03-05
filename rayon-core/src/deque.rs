@@ -77,7 +77,6 @@ impl Hash for Deque {
     }
 }
 
-// TODO: keep Deref impls?
 impl Deref for Deque {
     type Target = CrossbeamWorker<JobRef>;
 
@@ -212,27 +211,23 @@ impl Stealables {
 
     /// Use this if the deque already exists in the deque_stealers mapping, otherwise use
     /// [`Stealables::add_new_deque_to_stealable_set`]
-    pub(super) fn add_existing_deque_to_stealable_set(
-        &self,
-        lock: Option<&mut StealablesLock<'_>>,
+    pub(super) fn add_existing_deque_to_stealable_set<'a>(
+        &'a self,
+        lock: Option<&mut StealablesLock<'a>>,
         thread_index: ThreadIndex,
         deque_id: DequeId,
     ) {
         assert!(thread_index < self.stealable_sets.len());
 
-        let mut s;
-        let stealable_set_index = if let Some(lock) = lock {
-            let (_, _, stealable_set_index) = lock.value_mut();
-            stealable_set_index
-        } else {
-            // Get a reference here to ensure we hold internal DashMap lock for entire scope of function
-            s = self
-                .deque_stealers
-                .get_mut(&deque_id)
-                .expect("Deque ID should have been in stealables mapping, but was not found");
-            let (_, _, stealable_set_index) = s.value_mut();
-            stealable_set_index
-        };
+        let mut t = None; // Just used as storage for a temporary
+        let lock = lock
+            .or_else(|| {
+                t = self.get_lock(deque_id);
+                t.as_mut()
+            })
+            .expect("Deque ID should have been in stealables mapping, but was not found");
+
+        let (_, _, stealable_set_index) = lock.value_mut();
 
         match stealable_set_index {
             // Deque recorded to already be in stealable set we want to move deque into, no need to
@@ -259,24 +254,22 @@ impl Stealables {
     /// Removes a deque from its stealable set. Note that if you want to *destroy* a deque (i.e.
     /// free the deque and clean up all resources associated with it), call
     /// [`Stealables::destroy_deque`] instead.
-    pub(super) fn remove_deque_from_stealable_set(
-        &self,
-        lock: Option<&mut StealablesLock<'_>>,
+    pub(super) fn remove_deque_from_stealable_set<'a>(
+        &'a self,
+        lock: Option<&mut StealablesLock<'a>>,
         deque_id: DequeId,
     ) -> Result<ThreadIndex, ()> {
-        let mut s;
-        // TODO: should probably refactor this and other methods to use get_lock
-        let stealable_set_index = if let Some(lock) = lock {
-            let (_, _, stealable_set_index) = lock.value_mut();
-            stealable_set_index
-        } else {
-            // Get a reference here to ensure we hold internal DashMap lock for scope entire of function
-            s = self.deque_stealers.get_mut(&deque_id).expect(
+        let mut t = None; // Just used as storage for a temporary
+        let lock = lock
+            .or_else(|| {
+                t = self.get_lock(deque_id);
+                t.as_mut()
+            })
+            .expect(
                 "Deque stealer already destroyed when trying to remove deque from stealable set",
             );
-            let (_, _, stealable_set_index) = s.value_mut();
-            stealable_set_index
-        };
+
+        let (_, _, stealable_set_index) = lock.value_mut();
 
         // Only try to remove a deque from a stealable set if it is recorded as not being in a
         // stealable set. Otherwise, since it is (apparently) not in a stealable set there is
@@ -300,8 +293,6 @@ impl Stealables {
 
                     Ok(set_index)
                 }
-                // TODO: I think this should actually never occur, since we are holding a DashMap lock
-                // above, and really we should panic in this case
                 Err(_) => {
                     self.registry
                         .as_ref()
@@ -496,7 +487,7 @@ impl<'a> FromIterator<&'a Deque> for Stealables {
 /// Basically contains a set of stealable deque IDs
 struct StealableSet {
     stealable_deque_ids: Mutex<(HashMap<DequeId, usize>, Vec<DequeId>, XorShift64Star)>, // TODO: maybe use RwLock?
-    index: ThreadIndex, // TODO: remove this, just using temporarily for debugging
+    index: ThreadIndex, // Just used for debugging
 }
 
 impl StealableSet {
@@ -552,7 +543,6 @@ impl StealableSet {
             Ok(())
         } else {
             Err(())
-            // unreachable!(); // TODO: see if the DashMap lock in remove_deque_from_stealable_set is enough to prevent this case from happening here
         }
     }
 }
