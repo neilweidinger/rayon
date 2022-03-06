@@ -31,7 +31,6 @@ pub(crate) mod worker_thread;
 pub struct ThreadBuilder {
     name: Option<String>,
     stack_size: Option<usize>,
-    active_deque: Deque,
     registry: Arc<Registry>,
     index: ThreadIndex,
     stealables: Arc<Stealables>,
@@ -59,7 +58,6 @@ impl ThreadBuilder {
     pub fn run(self) {
         unsafe {
             main_loop(
-                self.active_deque,
                 self.registry,
                 self.index,
                 self.stealables,
@@ -234,17 +232,6 @@ impl Registry {
         let n_threads = builder.get_num_threads();
         let breadth_first = builder.get_breadth_first();
         let deque_id = AtomicUsize::new(0);
-
-        let deques: Vec<_> = (0..n_threads)
-            .map(|_| {
-                if breadth_first {
-                    Deque::new_fifo(DequeId::new(deque_id.fetch_add(1, Ordering::Relaxed)))
-                } else {
-                    Deque::new_lifo(DequeId::new(deque_id.fetch_add(1, Ordering::Relaxed)))
-                }
-            })
-            .collect();
-
         let logger = Logger::new(n_threads);
 
         let registry = Arc::new(Registry {
@@ -261,21 +248,17 @@ impl Registry {
             breadth_first,
         });
 
-        let mut stealables = Arc::new(deques.iter().collect::<Stealables>());
-        Arc::get_mut(&mut stealables)
-            .unwrap()
-            .set_registry(registry.clone());
+        let stealables = Arc::new(Stealables::new(n_threads, registry.clone()));
         let set_to_active_lock = Arc::new(Mutex::new(()));
 
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        for (index, deque) in deques.into_iter().enumerate() {
+        for index in 0..n_threads {
             let thread = ThreadBuilder {
                 name: builder.get_thread_name(index),
                 stack_size: builder.get_stack_size(),
                 registry: registry.clone(),
-                active_deque: deque,
                 index,
                 stealables: stealables.clone(),
                 set_to_active_lock: set_to_active_lock.clone(),
@@ -631,7 +614,6 @@ impl ThreadInfo {
 }
 
 unsafe fn main_loop(
-    deque: Deque,
     registry: Arc<Registry>,
     index: ThreadIndex,
     stealables: Arc<Stealables>,
@@ -642,7 +624,7 @@ unsafe fn main_loop(
     // the currently running thread (currently running thread stored in thread local
     // WORKER_THREAD_STATE)
     let worker_thread = &WorkerThread::new(
-        UnsafeCell::new(Some(deque)),
+        UnsafeCell::new(None),
         stealables,
         set_to_active_lock,
         JobFifo::new(),

@@ -117,6 +117,10 @@ impl WorkerThread {
 
     #[inline]
     pub(crate) fn push(&self, job: JobRef) {
+        if unsafe { &*self.active_deque.get() }.is_none() {
+            self.create_new_active_deque();
+        }
+
         let active_deque = unsafe { &mut *self.active_deque.get() }.as_mut().unwrap();
         let queue_was_empty = active_deque.is_empty();
         active_deque.push(job);
@@ -226,6 +230,26 @@ impl WorkerThread {
         JobRef::execute(ExecutionContext::new(self, job));
     }
 
+    fn create_new_active_deque(&self) {
+        // TODO: potential deque recycling optimization
+        let new_active_deque = if self.registry().breadth_first() {
+            Deque::new_fifo(DequeId::new(self.registry().next_deque_id()))
+        } else {
+            Deque::new_lifo(DequeId::new(self.registry().next_deque_id()))
+        };
+
+        // Add freshly created active deque to worker stealable set
+        self.stealables.add_new_deque_to_stealable_set(
+            self.index,
+            &new_active_deque,
+            DequeState::Active,
+        );
+
+        unsafe {
+            *self.active_deque.get() = Some(new_active_deque);
+        }
+    }
+
     /// Try to steal a single job and return it.
     ///
     /// This should only be done as a last resort, when there is no
@@ -301,27 +325,11 @@ impl WorkerThread {
                     }
 
                     // This worker thread that is trying to steal may not have an active deque if
-                    // during the execution of its last job it encountered a blocked future (the
+                    // during the execution of its last job it encountered a blocked future: the
                     // worker thread active_deque is set to None so that here in the steal
-                    // procedure we know to create a new active deque)
+                    // procedure we know to create a new active deque.
                     if unsafe { &*self.active_deque.get() }.is_none() {
-                        // TODO: potential deque recycling optimization
-                        let new_active_deque = if self.registry().breadth_first() {
-                            Deque::new_fifo(DequeId::new(self.registry().next_deque_id()))
-                        } else {
-                            Deque::new_lifo(DequeId::new(self.registry().next_deque_id()))
-                        };
-
-                        // Add freshly created active deque to worker stealable set
-                        self.stealables.add_new_deque_to_stealable_set(
-                            self.index,
-                            &new_active_deque,
-                            DequeState::Active,
-                        );
-
-                        unsafe {
-                            *self.active_deque.get() = Some(new_active_deque);
-                        }
+                        self.create_new_active_deque();
                     }
 
                     // No need to push popped job on to active deque, we would pop this job off in

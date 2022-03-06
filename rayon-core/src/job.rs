@@ -228,7 +228,6 @@ impl<T> JobResult<T> {
     }
 }
 
-// Represents top level task
 pub(super) struct FutureJob<L, F>
 where
     L: Latch + Sync,
@@ -350,6 +349,10 @@ impl FutureJobWaker {
         // again)
         // TODO: this will awaken threads, but there is no guarantee that this specific Resumable
         // deque will be chosen and this JobRef be stolen
+        // THIS IS CAUSING INVERSHIN TO HANG (I THINK), SINCE THERE ARE SO MANY STEALABLE SETS AND
+        // DEQUES TO CHOOSE FROM THAT THE CHANCE OF RANDOMLY SELECTING THE NOW-RESUMABLE DEQUE
+        // BECOMES EXTREMELY SLIM, THE WORKER THREADS THINK THEY CAN'T FIND WORK AND END UP JUST
+        // GOING TO SLEEP, FOREVER!
         registry.wake_any_worker_thread();
     }
 

@@ -7,7 +7,6 @@ use dashmap::mapref::one::RefMut;
 use dashmap::DashMap;
 use std::collections::HashMap;
 use std::hash::{Hash, Hasher};
-use std::iter::FromIterator;
 use std::ops::{Deref, DerefMut};
 use std::sync::{Arc, Mutex};
 
@@ -92,9 +91,9 @@ impl DerefMut for Deque {
 }
 
 // Although very scary, this should be safe since a crossbeam Worker should only be interacted with
-// by one thread at a time (Deque's are stored in the deque bench where they are not touched, and
-// only when a worker thread has ownership of a Deque as its current active deque is the crossbeam
-// Worker interacted with)
+// by one thread at a time: Deque's are stored in the deque bench where they are not interacted
+// with, and only when a worker thread has ownership of a Deque as its current active deque is the
+// crossbeam Worker interacted with.
 unsafe impl Sync for Deque {}
 
 pub(super) type ThreadIndex = usize;
@@ -113,12 +112,16 @@ pub(super) struct Stealables {
     // implementation simplicity)
     deque_stealers: DashMap<DequeId, (Stealer<JobRef>, DequeState, Option<ThreadIndex>)>,
 
-    registry: Option<Arc<Registry>>, // just used for logging
+    registry: Arc<Registry>, // just used for logging
 }
 
 impl Stealables {
-    pub(super) fn set_registry(&mut self, registry: Arc<Registry>) {
-        self.registry = Some(registry);
+    pub(super) fn new(n_threads: usize, registry: Arc<Registry>) -> Self {
+        Self {
+            stealable_sets: (0..n_threads).map(|_| StealableSet::new()).collect(), // TODO: create with capacity? CachePadded??
+            deque_stealers: DashMap::new(), // TODO: create with capacity? CachePadded??
+            registry,
+        }
     }
 
     /// This returns a reference to an entry in the DashMap. The idea is that by holding a mutable
@@ -127,38 +130,11 @@ impl Stealables {
     /// work. Note that you should not use this to enforce critical sections (mutual exclusion in a
     /// code path), as holding a reference only guarantees that mutations to the entry are atomic,
     /// and does not necessarily imply mutual exclusion of an arbitrary code path (case in point,
-    /// the mutex we hold in [`WorkerThread::set_to_active`]).
+    /// the mutex we need in [`WorkerThread::set_to_active`]).
     #[must_use]
     #[inline]
     pub(super) fn get_lock(&self, deque_id: DequeId) -> Option<StealablesLock<'_>> {
         self.deque_stealers.get_mut(&deque_id)
-    }
-
-    /// Update the state of a deque. Checking deque state is only important in two places: when
-    /// performing a steal and when the Future waker needs to know whether to insert a newly
-    /// resumable deque into a victim thread's stealable set or not (the newly resumable deque may
-    /// have been in the suspended state but still in a workers stealable set if the deque had
-    /// non-suspended jobs, or it may have only contained the suspended job and not have been in
-    /// any stealable set). Additionally, a suspended deque but with non-suspended jobs may have
-    /// randomly been rebalanced to other stealable sets.
-    ///
-    /// The Future Waker needs a quick way to determine whether a deque is in a stealable set or
-    /// not. TODO: finish this doc comment
-    pub(super) fn update_deque_state(
-        &self,
-        lock: Option<&mut StealablesLock<'_>>,
-        deque_id: DequeId,
-        deque_state: DequeState,
-    ) {
-        if let Some(lock) = lock {
-            lock.value_mut().1 = deque_state;
-        } else {
-            self.deque_stealers
-                .get_mut(&deque_id)
-                .expect("Deque ID should have been in stealables mapping, but was not found")
-                .value_mut()
-                .1 = deque_state;
-        }
     }
 
     #[must_use]
@@ -191,6 +167,23 @@ impl Stealables {
         self.stealable_sets.len()
     }
 
+    pub(super) fn update_deque_state(
+        &self,
+        lock: Option<&mut StealablesLock<'_>>,
+        deque_id: DequeId,
+        deque_state: DequeState,
+    ) {
+        if let Some(lock) = lock {
+            lock.value_mut().1 = deque_state;
+        } else {
+            self.deque_stealers
+                .get_mut(&deque_id)
+                .expect("Deque ID should have been in stealables mapping, but was not found")
+                .value_mut()
+                .1 = deque_state;
+        }
+    }
+
     pub(super) fn add_new_deque_to_stealable_set(
         &self,
         thread_index: ThreadIndex,
@@ -208,13 +201,10 @@ impl Stealables {
             "Stealable set already contained deque ID, when trying to add new deque"
         );
 
-        self.registry
-            .as_ref()
-            .unwrap()
-            .log(|| NewDequeAddedToStealableSet {
-                stealable_set_index: thread_index,
-                deque_id: deque.id,
-            });
+        self.registry.as_ref().log(|| NewDequeAddedToStealableSet {
+            stealable_set_index: thread_index,
+            deque_id: deque.id,
+        });
     }
 
     /// Use this if the deque already exists in the deque_stealers mapping, otherwise use
@@ -250,7 +240,6 @@ impl Stealables {
 
                 self.registry
                     .as_ref()
-                    .unwrap()
                     .log(|| ExistingDequeAddedToStealableSet {
                         stealable_set_index: thread_index,
                         deque_id,
@@ -291,20 +280,16 @@ impl Stealables {
             // set before this thread has had the chance to remove it.
             match self.stealable_sets[set_index].remove_deque(deque_id) {
                 Ok(_) => {
-                    self.registry
-                        .as_ref()
-                        .unwrap()
-                        .log(|| DequeRemovedFromStealableSet {
-                            stealable_set_index: set_index,
-                            deque_id,
-                        });
+                    self.registry.as_ref().log(|| DequeRemovedFromStealableSet {
+                        stealable_set_index: set_index,
+                        deque_id,
+                    });
 
                     Ok(set_index)
                 }
                 Err(_) => {
                     self.registry
                         .as_ref()
-                        .unwrap()
                         .log(|| DequeRemovedFromStealableSetFailed {
                             stealable_set_index: set_index,
                             deque_id,
@@ -316,7 +301,6 @@ impl Stealables {
         } else {
             self.registry
                 .as_ref()
-                .unwrap()
                 .log(|| DequeRemovedFromStealableSetNotPerfomed { deque_id });
 
             Err(())
@@ -352,7 +336,7 @@ impl Stealables {
         let mut rebalance_closure = |attempt| -> Result<(), ()> {
             let victim_index = RNG.with(|rng| rng.next_usize(self.get_num_threads()));
 
-            self.registry.as_ref().unwrap().log(|| RebalanceStealables {
+            self.registry.as_ref().log(|| RebalanceStealables {
                 attempt,
                 thread_index,
                 victim_index,
@@ -426,7 +410,7 @@ impl Stealables {
         let deque_state = *deque_state;
 
         if deque_stealer.is_empty() {
-            self.registry.as_ref().unwrap().log(|| HandlingEmptyDeque {
+            self.registry.as_ref().log(|| HandlingEmptyDeque {
                 deque_id,
                 deque_state,
             });
@@ -454,36 +438,12 @@ impl Stealables {
 
             true
         } else {
-            self.registry
-                .as_ref()
-                .unwrap()
-                .log(|| HandlingEmptyDequeNotEmpty {
-                    deque_id,
-                    deque_state,
-                });
+            self.registry.as_ref().log(|| HandlingEmptyDequeNotEmpty {
+                deque_id,
+                deque_state,
+            });
 
             false
-        }
-    }
-}
-
-impl<'a> FromIterator<&'a Deque> for Stealables {
-    /// Use only during creation of registry. This assumes that each deque in the iterator
-    /// represents the one *active* deque per thread during creation of the registry.
-    fn from_iter<I: IntoIterator<Item = &'a Deque>>(iter: I) -> Self {
-        let deque_stealers = DashMap::new(); // TODO: create with capacity? CachePadded??
-        let mut stealable_sets = Vec::new(); // TODO: create with capacity? CachePadded??
-
-        for (index, deque) in iter.into_iter().enumerate() {
-            deque_stealers.insert(deque.id, (deque.stealer(), DequeState::Active, Some(index)));
-            stealable_sets.push(IntoIterator::into_iter([deque.id]).collect::<StealableSet>());
-            stealable_sets.last_mut().unwrap().index = index;
-        }
-
-        Self {
-            stealable_sets,
-            deque_stealers,
-            registry: None,
         }
     }
 }
@@ -491,20 +451,21 @@ impl<'a> FromIterator<&'a Deque> for Stealables {
 /// Basically contains a set of stealable deque IDs
 struct StealableSet {
     stealable_deque_ids: Mutex<(HashMap<DequeId, usize>, Vec<DequeId>)>, // TODO: maybe use RwLock?
-    index: ThreadIndex,                                                  // Just used for debugging
 }
 
 impl StealableSet {
+    #[must_use]
+    fn new() -> Self {
+        Self {
+            stealable_deque_ids: Mutex::new((HashMap::new(), Vec::new())),
+        }
+    }
+
     /// Returns a random deque ID in this stealable set, otherwise None if it contains no deque
     /// ID's
     #[must_use]
     fn get_random_deque_id(&self) -> Option<DequeId> {
         let (_, v) = &*self.stealable_deque_ids.lock().unwrap();
-
-        // eprintln!(
-        //     "stealable_set_index: {} getting random deque: {:?}",
-        //     self.index, v
-        // );
 
         if v.is_empty() {
             return None;
@@ -547,22 +508,6 @@ impl StealableSet {
             Ok(())
         } else {
             Err(())
-        }
-    }
-}
-
-impl FromIterator<DequeId> for StealableSet {
-    fn from_iter<I: IntoIterator<Item = DequeId>>(iter: I) -> Self {
-        let v: Vec<_> = iter.into_iter().collect();
-        let mut map = HashMap::with_capacity(v.len());
-
-        for (index, deque_id) in v.iter().enumerate() {
-            map.insert(*deque_id, index);
-        }
-
-        Self {
-            stealable_deque_ids: Mutex::new((map, v)),
-            index: 0,
         }
     }
 }
