@@ -159,6 +159,23 @@ impl Stealables {
         self.stealable_sets[thread_index].get_random_deque_id()
     }
 
+    #[must_use]
+    #[inline]
+    pub(super) fn find_stealable_deque_id(&self) -> Option<(ThreadIndex, DequeId)> {
+        let start = RNG.with(|rng| rng.next_usize(self.stealable_sets.len()));
+
+        self.stealable_sets
+            .iter()
+            .skip(start)
+            .chain(self.stealable_sets.iter().take(start))
+            .enumerate()
+            .find_map(|(stealable_set_index, stealable_set)| {
+                stealable_set
+                    .get_random_deque_id()
+                    .map(|stealable_set| (stealable_set_index, stealable_set))
+            })
+    }
+
     // TODO: this function doesn't really belong to Stealables, try and find a nicer way to get the
     // number of worker threads
     #[must_use]
@@ -390,9 +407,9 @@ impl Stealables {
             Err(())
         };
 
-        let rebalance_attempts = 3; // TODO: totally arbitrary, find a better cap
+        const REBALANCE_ATTEMPTS: usize = 3; // TODO: totally arbitrary, find a better cap
 
-        for i in 0..rebalance_attempts {
+        for i in 0..REBALANCE_ATTEMPTS {
             if let Ok(_) = rebalance_closure(i) {
                 return;
             }

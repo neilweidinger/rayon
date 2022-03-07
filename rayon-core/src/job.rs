@@ -347,12 +347,6 @@ impl FutureJobWaker {
         // Signal threads to wake up (it could be the case that all worker threads are sleeping,
         // and if we don't explictly signal a thread to wake up this job will never get polled
         // again)
-        // TODO: this will awaken threads, but there is no guarantee that this specific Resumable
-        // deque will be chosen and this JobRef be stolen
-        // THIS IS CAUSING INVERSHIN TO HANG (I THINK), SINCE THERE ARE SO MANY STEALABLE SETS AND
-        // DEQUES TO CHOOSE FROM THAT THE CHANCE OF RANDOMLY SELECTING THE NOW-RESUMABLE DEQUE
-        // BECOMES EXTREMELY SLIM, THE WORKER THREADS THINK THEY CAN'T FIND WORK AND END UP JUST
-        // GOING TO SLEEP, FOREVER!
         registry.wake_any_worker_thread();
     }
 

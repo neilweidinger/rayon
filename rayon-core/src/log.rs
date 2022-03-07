@@ -149,7 +149,7 @@ pub(super) enum Event {
 
     /// The given worker has successfully stolen a job from the deque of another.
     JobStolen {
-        attempt: i32,
+        attempt: usize,
         worker: usize,
         victim_thread: usize,
         victim_deque_id: DequeId,
@@ -157,7 +157,7 @@ pub(super) enum Event {
 
     /// The given worker attempted to steal a job, but failed.
     JobStolenFail {
-        attempt: i32,
+        attempt: usize,
         worker: usize,
         victim_thread: usize,
         victim_deque_id: DequeId,
@@ -188,7 +188,7 @@ pub(super) enum Event {
     },
 
     RebalanceStealables {
-        attempt: i32,
+        attempt: usize,
         thread_index: usize,
         victim_index: usize,
     },
@@ -506,11 +506,6 @@ impl SimulatorState {
 
         let event_str = format!("{:?}", event);
         write!(w, r#""{:60}","#, event_str)?;
-
-        for (i, state) in (0..).zip(&self.thread_states) {
-            write!(w, " T{:02},{}", i, state.letter(),)?;
-            write!(w, ",   ,")?;
-        }
 
         write!(w, "\n")?;
         Ok(())
