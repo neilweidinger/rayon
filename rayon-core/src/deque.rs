@@ -410,7 +410,7 @@ impl Stealables {
         const REBALANCE_ATTEMPTS: usize = 3; // TODO: totally arbitrary, find a better cap
 
         for i in 0..REBALANCE_ATTEMPTS {
-            if let Ok(_) = rebalance_closure(i) {
+            if rebalance_closure(i).is_ok() {
                 return;
             }
         }

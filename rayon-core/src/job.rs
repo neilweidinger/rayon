@@ -321,8 +321,15 @@ impl FutureJobWaker {
             DequeState::Resumable,
         );
 
-        // If deque not already in a stealable set, we must place it in some thread's stealable set.
-        if stealable_set_index.is_none() {
+        // If deque already in stealable set, just leave it there, no need to do anything
+        if let Some(stealable_set_index) = stealable_set_index {
+            registry.log(|| Event::WakerAwoken {
+                suspended_deque_id: self.suspended_deque_id,
+                stealable_set_index,
+            });
+        }
+        // If deque *not* already in a stealable set, we must place it in some thread's stealable set
+        else {
             let random_victim_index = RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
 
             registry.log(|| Event::WakerAwokenAndDequeInserted {
@@ -337,11 +344,6 @@ impl FutureJobWaker {
                 random_victim_index,
                 self.suspended_deque_id,
             );
-        } else {
-            registry.log(|| Event::WakerAwoken {
-                suspended_deque_id: self.suspended_deque_id,
-                stealable_set_index: stealable_set_index.expect("I will go crazy if this panics"),
-            });
         }
 
         // Signal threads to wake up (it could be the case that all worker threads are sleeping,
