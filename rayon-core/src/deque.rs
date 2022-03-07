@@ -166,9 +166,9 @@ impl Stealables {
 
         self.stealable_sets
             .iter()
-            .skip(start)
-            .chain(self.stealable_sets.iter().take(start))
             .enumerate()
+            .skip(start)
+            .chain(self.stealable_sets.iter().enumerate().take(start))
             .find_map(|(stealable_set_index, stealable_set)| {
                 stealable_set
                     .get_random_deque_id()
