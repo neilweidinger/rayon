@@ -475,9 +475,11 @@ where
                     same ID"
                 );
 
-                // Only once we reach here and all the above blocked future logic is completed is
-                // the waker allowed to proceed
-                CoreLatch::set(&(*future_job_waker_ptr).latch);
+                // Only once we reach here and all the above pending future logic is completed is
+                // the waker allowed to proceed. This is to prevent cases such as where without the
+                // latch it would be possible for the waker to start executing before the deque has
+                // been moved into the bench.
+                (*future_job_waker_ptr).latch.set();
             }
         };
 

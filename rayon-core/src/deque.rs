@@ -209,6 +209,9 @@ impl Stealables {
     ) {
         assert!(thread_index < self.stealable_sets.len());
 
+        // Add deque to selected threads stealable set
+        self.stealable_sets[thread_index].add_deque(deque.id);
+
         let key_already_existed = self
             .deque_stealers
             .insert(deque.id, (deque.stealer(), deque_state, Some(thread_index)));
