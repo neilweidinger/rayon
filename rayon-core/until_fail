@@ -1,3 +1,13 @@
 #!/bin/bash
+# https://stackoverflow.com/questions/12967232/repeatedly-run-a-shell-command-until-it-fails
 
-while "$@" 2>&1; do :; done
+attempt=0
+echo "Attempt $attempt"
+"$@"
+attempt=$((attempt + 1))
+
+while [ "$?" -eq 0 ]; do
+    echo "Attempt $attempt"
+    "$@"
+    attempt=$((attempt + 1))
+done
