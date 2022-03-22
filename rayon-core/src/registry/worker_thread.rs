@@ -310,9 +310,6 @@ impl WorkerThread {
         // otherwise, try to steal
         let thread_infos = &self.registry.thread_infos.as_slice();
         let num_threads = thread_infos.len();
-        if num_threads <= 1 {
-            return None;
-        }
 
         // Attempt steal procedure steal_attempts times.
         // Any use of the question mark error propogation operator means that a deque is not
