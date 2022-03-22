@@ -341,30 +341,30 @@ impl WorkerThread {
                     return self.set_to_active(victim_deque_id, victim_thread);
                 }
 
-                match deque_stealer.steal() {
+                let stolen_job = deque_stealer.steal();
+
+                // Right after we attempt to steal from the victim deque, we handle the case where
+                // the victim deque is possibly empty. If the deque is not empty and the deque is
+                // marked resumable this means there are more jobs in the deque also waiting to be
+                // executed, so we mark this deque as muggable so that another thread can mug this
+                // entire deque in the future.
+                if !self.stealables.handle_empty_deque(victim_deque_id)
+                    && deque_state == DequeState::Resumable
+                {
+                    // TODO: should we use a lock here?
+                    self.stealables
+                        .update_deque_state(None, victim_deque_id, DequeState::Muggable);
+                }
+
+                match stolen_job {
                     Steal::Success(job) => {
                         self.log(|| JobStolen {
                             attempt,
                             worker: self.index,
                             victim_thread,
                             victim_deque_id,
+                            deque_state,
                         });
-
-                        // First handle potentially empty victim deque (since we have just stolen from
-                        // it). If the deque is not empty and the deque is marked resumable this means
-                        // there are more jobs in the deque also waiting to be executed, so we mark
-                        // this deque as muggable so that another thread can mug this entire deque in
-                        // the future.
-                        if !self.stealables.handle_empty_deque(victim_deque_id)
-                            && deque_state == DequeState::Resumable
-                        {
-                            // TODO: should we use a lock here?
-                            self.stealables.update_deque_state(
-                                None,
-                                victim_deque_id,
-                                DequeState::Muggable,
-                            );
-                        }
 
                         // This worker thread that is trying to steal may not have an active deque if
                         // during the execution of its last job it encountered a blocked future: the
@@ -386,6 +386,7 @@ impl WorkerThread {
                             worker: self.index,
                             victim_thread,
                             victim_deque_id,
+                            deque_state,
                         });
 
                         None

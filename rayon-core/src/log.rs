@@ -153,6 +153,7 @@ pub(super) enum Event {
         worker: usize,
         victim_thread: usize,
         victim_deque_id: DequeId,
+        deque_state: DequeState,
     },
 
     /// The given worker attempted to steal a job, but failed.
@@ -161,6 +162,7 @@ pub(super) enum Event {
         worker: usize,
         victim_thread: usize,
         victim_deque_id: DequeId,
+        deque_state: DequeState,
     },
 
     NewDequeAddedToStealableSet {

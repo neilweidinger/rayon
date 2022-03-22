@@ -101,7 +101,6 @@ pub(super) type StealablesLock<'a> =
     RefMut<'a, DequeId, (Stealer<JobRef>, DequeState, Option<ThreadIndex>)>;
 
 pub(super) struct Stealables {
-    stealable_sets: Vec<StealableSet>,
     // ThreadIndex represents the thread
     // index that has this deque in its
     // stealable set (a deque can be unstealable
@@ -111,6 +110,7 @@ pub(super) struct Stealables {
     // stealer here in the mapping for
     // implementation simplicity)
     deque_stealers: DashMap<DequeId, (Stealer<JobRef>, DequeState, Option<ThreadIndex>)>,
+    stealable_sets: Vec<StealableSet>,
 
     registry: Arc<Registry>, // just used for logging
 }
