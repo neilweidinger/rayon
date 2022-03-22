@@ -23,17 +23,15 @@ pub(super) enum JobResult<T> {
 
 pub(super) struct ExecutionContext<'a> {
     worker_thread: &'a WorkerThread,
-    job_ref: JobRef,
 
     /// disable `Send` and `Sync`, just for a little future-proofing.
     _marker: PhantomData<*mut ()>,
 }
 
 impl<'a> ExecutionContext<'a> {
-    pub(super) fn new(worker_thread: &'a WorkerThread, job_ref: JobRef) -> Self {
+    pub(super) fn new(worker_thread: &'a WorkerThread) -> Self {
         Self {
             worker_thread,
-            job_ref,
             _marker: PhantomData,
         }
     }
@@ -83,9 +81,9 @@ impl JobRef {
     }
 
     #[inline]
-    pub(super) unsafe fn execute(context: ExecutionContext<'_>) {
-        let execute_fn = context.job_ref.execute_fn;
-        let job_pointer = context.job_ref.pointer;
+    pub(super) unsafe fn execute(&self, context: ExecutionContext<'_>) {
+        let execute_fn = self.execute_fn;
+        let job_pointer = self.pointer;
         execute_fn(job_pointer, context);
     }
 }
@@ -427,7 +425,7 @@ where
             stealables,
             suspended_deque_id: deque_id,
             registry: worker_thread.registry(),
-            suspended_job_ref: execution_context.job_ref,
+            suspended_job_ref: this.as_job_ref(),
             latch: CoreLatch::new(),
         };
 
@@ -550,13 +548,12 @@ impl JobFifo {
 }
 
 impl Job for JobFifo {
-    unsafe fn execute(this: *const Self, mut context: ExecutionContext<'_>) {
+    unsafe fn execute(this: *const Self, context: ExecutionContext<'_>) {
         // We "execute" a queue by executing its first job, FIFO.
         loop {
             match (*this).inner.steal() {
                 Steal::Success(job_ref) => {
-                    context.job_ref = job_ref;
-                    JobRef::execute(context);
+                    job_ref.execute(context);
                     break;
                 }
                 Steal::Empty => panic!("FIFO is empty"),

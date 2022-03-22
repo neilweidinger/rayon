@@ -227,7 +227,7 @@ impl WorkerThread {
 
     #[inline]
     pub(super) unsafe fn execute(&self, job: JobRef) {
-        JobRef::execute(ExecutionContext::new(self, job));
+        job.execute(ExecutionContext::new(self));
     }
 
     pub(crate) fn create_new_active_deque(&self) {
