@@ -230,7 +230,12 @@ impl WorkerThread {
         JobRef::execute(ExecutionContext::new(self, job));
     }
 
-    fn create_new_active_deque(&self) {
+    pub(crate) fn create_new_active_deque(&self) {
+        assert!(
+            (unsafe { &*self.active_deque.get() }).is_none(),
+            "Creating new active deque, but worker thread already has an active deque"
+        );
+
         // TODO: potential deque recycling optimization
         let new_active_deque = if self.registry().breadth_first() {
             Deque::new_fifo(DequeId::new(self.registry().next_deque_id()))
@@ -364,7 +369,9 @@ impl WorkerThread {
                         // This worker thread that is trying to steal may not have an active deque if
                         // during the execution of its last job it encountered a blocked future: the
                         // worker thread active_deque is set to None so that here in the steal
-                        // procedure we know to create a new active deque.
+                        // procedure we know to create a new active deque. This can also happen
+                        // during Rayon startup, since worker threads are only allocated active
+                        // deques when jobs are first pushed.
                         if unsafe { &*self.active_deque.get() }.is_none() {
                             self.create_new_active_deque();
                         }
@@ -434,6 +441,11 @@ impl WorkerThread {
         // TODO: possible optimization where we don't free deques, but leave them allocated for
         // later use again (no idea if this would work).
         if let Some(active_deque) = unsafe { &mut *self.active_deque.get() }.take() {
+            assert!(
+                active_deque.is_empty(),
+                "Trying to destroy active deque that was not empty"
+            );
+
             // Destroy current active deque stealable resources
             // TODO: deque stealable resources must be destroyed before the actual deque worker is
             // destroyed, to avoid threads trying to steal from this deque when it's worker no

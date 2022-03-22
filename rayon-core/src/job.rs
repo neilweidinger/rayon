@@ -320,7 +320,7 @@ impl FutureJobWaker {
 
         assert!(
             deque_state == DequeState::Suspended,
-            "Future triggered waker, but deque this future belongs to was not marked as suspended"
+            "Future triggered waker, but deque {:?} this future belongs to was not marked as Suspended (marked {:?})", self.suspended_deque_id, deque_state
         );
 
         let registry = unsafe { &*self.registry };
@@ -461,10 +461,18 @@ where
                     executing_worker_thread: worker_thread.index(),
                 });
 
-                // Set active deque for worker thread to None so that thread steals on next round
-                let active_deque = { &mut *worker_thread.active_deque().get() }
-                    .take()
-                    .expect("Worker thread executing a job erroneously has no active deque");
+                let active_deque = {
+                    // It's possible that this thread has no active deque if it is early during
+                    // Rayon setup and an active deque has not been allocated for this worker
+                    // thread
+                    if { &mut *worker_thread.active_deque().get() }.is_none() {
+                        worker_thread.create_new_active_deque();
+                    }
+
+                    &mut *worker_thread.active_deque().get()
+                }
+                .take() // Set active deque for worker thread to None so that thread steals on next round
+                .expect("Worker thread executing a job erroneously has no active deque");
 
                 // Mark deque as suspended
                 // TODO: get Stealables lock for here and other operations below?

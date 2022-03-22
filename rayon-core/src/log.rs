@@ -187,6 +187,11 @@ pub(super) enum Event {
         deque_id: DequeId,
     },
 
+    DequeStateUpdated {
+        deque_id: DequeId,
+        deque_state: DequeState,
+    },
+
     RebalanceStealables {
         attempt: usize,
         thread_index: usize,

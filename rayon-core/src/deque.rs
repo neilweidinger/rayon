@@ -199,6 +199,11 @@ impl Stealables {
                 .value_mut()
                 .1 = deque_state;
         }
+
+        self.registry.as_ref().log(|| DequeStateUpdated {
+            deque_id,
+            deque_state,
+        });
     }
 
     pub(super) fn add_new_deque_to_stealable_set(
