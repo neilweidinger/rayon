@@ -414,16 +414,25 @@ where
         let worker_thread = execution_context.worker_thread;
         let stealables = execution_context.worker_thread.stealables();
 
+        let active_deque = {
+            // It's possible that this thread has no active deque if it is early during
+            // Rayon setup and an active deque has not been allocated for this worker
+            // thread
+            if { &mut *worker_thread.active_deque().get() }.is_none() {
+                worker_thread.create_new_active_deque();
+            }
+
+            &mut *worker_thread.active_deque().get()
+        }
+        .take() // Set active deque for worker thread to None so that thread steals on next round
+        .expect("Worker thread executing a job erroneously has no active deque");
+
         // Get the ID of the deque this FutureJob is in, since it may return pending and this deque
         // will become suspended, and the waker will need to know the ID of this deque in order to
         // mark it resumable
-        let deque_id = { &*worker_thread.active_deque().get() }
-            .as_ref()
-            .expect("Worker thread executing a job erroneously has no active deque")
-            .id();
         let future_job_waker = FutureJobWaker {
             stealables,
-            suspended_deque_id: deque_id,
+            suspended_deque_id: active_deque.id(),
             registry: worker_thread.registry(),
             suspended_job_ref: this.as_job_ref(),
             latch: CoreLatch::new(),
@@ -446,7 +455,7 @@ where
         let execute_poll = || match pinned_future.poll(&mut context) {
             Poll::Ready(x) => {
                 worker_thread.registry().log(|| Event::FutureJobReady {
-                    deque_id,
+                    deque_id: active_deque.id(),
                     executing_worker_thread: worker_thread.index(),
                 });
 
@@ -455,22 +464,9 @@ where
             }
             Poll::Pending => {
                 worker_thread.registry().log(|| Event::FutureJobPending {
-                    deque_id,
+                    deque_id: active_deque.id(),
                     executing_worker_thread: worker_thread.index(),
                 });
-
-                let active_deque = {
-                    // It's possible that this thread has no active deque if it is early during
-                    // Rayon setup and an active deque has not been allocated for this worker
-                    // thread
-                    if { &mut *worker_thread.active_deque().get() }.is_none() {
-                        worker_thread.create_new_active_deque();
-                    }
-
-                    &mut *worker_thread.active_deque().get()
-                }
-                .take() // Set active deque for worker thread to None so that thread steals on next round
-                .expect("Worker thread executing a job erroneously has no active deque");
 
                 // Mark deque as suspended
                 // TODO: get Stealables lock for here and other operations below?
