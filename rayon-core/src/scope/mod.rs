@@ -5,13 +5,14 @@
 //! [`in_place_scope()`]: fn.in_place_scope.html
 //! [`join()`]: ../join/join.fn.html
 
-use crate::job::{HeapJob, JobFifo};
-use crate::latch::{CountLatch, CountLockLatch, Latch};
+use crate::job::{FutureHeapJob, HeapJob, JobFifo};
+use crate::latch::{AsCoreLatch, CoreLatch, CountLatch, CountLockLatch, Latch};
 use crate::registry::worker_thread::WorkerThread;
 use crate::registry::{global_registry, in_worker, Registry};
 use crate::unwind;
 use std::any::Any;
 use std::fmt;
+use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
@@ -39,7 +40,7 @@ pub struct ScopeFifo<'scope> {
     fifos: Vec<JobFifo>,
 }
 
-enum ScopeLatch {
+pub(crate) enum ScopeLatch {
     /// A latch for scopes created on a rayon thread which will participate in work-
     /// stealing while it waits for completion. This thread is not necessarily part
     /// of the same registry as the scope itself!
@@ -540,17 +541,32 @@ impl<'scope> Scope<'scope> {
         BODY: FnOnce(&Scope<'scope>) + Send + 'scope,
     {
         self.base.increment();
-        unsafe {
-            let job_ref = Box::new(HeapJob::new(move || {
+
+        let job_ref = unsafe {
+            Box::new(HeapJob::new(move || {
                 self.base.execute_job(move || body(self))
             }))
-            .as_job_ref();
+            .as_job_ref()
+        };
 
-            // Since `Scope` implements `Sync`, we can't be sure that we're still in a
-            // thread of this pool, so we can't just push to the local worker thread.
-            // Also, this might be an in-place scope.
-            self.base.registry.inject_or_push(job_ref);
-        }
+        // Since `Scope` implements `Sync`, we can't be sure that we're still in a
+        // thread of this pool, so we can't just push to the local worker thread.
+        // Also, this might be an in-place scope.
+        self.base.registry.inject_or_push(job_ref);
+    }
+
+    /// TODO: docs
+    pub fn spawn_future<FUT>(&self, future: FUT)
+    where
+        FUT: Future<Output = ()> + Send + 'scope,
+    {
+        self.base.increment();
+
+        let job_ref = unsafe {
+            Box::pin(FutureHeapJob::new(future, &self.base.job_completed_latch)).as_job_ref()
+        };
+
+        self.base.registry.inject_or_push(job_ref);
     }
 }
 
@@ -731,6 +747,21 @@ impl ScopeLatch {
                 owner.wait_until(latch);
             }
             ScopeLatch::Blocking { latch } => latch.wait(),
+        }
+    }
+}
+
+impl Latch for ScopeLatch {
+    fn set(&self) {
+        self.set();
+    }
+}
+
+impl AsCoreLatch for ScopeLatch {
+    fn as_core_latch(&self) -> &CoreLatch {
+        match self {
+            ScopeLatch::Stealing { latch, .. } => latch.as_core_latch(),
+            ScopeLatch::Blocking { .. } => unreachable!(),
         }
     }
 }

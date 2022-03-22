@@ -1,9 +1,9 @@
 use crate::deque::{DequeId, DequeState, Stealables, ThreadIndex};
-use crate::latch::CoreLatch;
-use crate::latch::Latch;
+use crate::latch::{CoreLatch, Latch};
 use crate::log::Event;
 use crate::registry::worker_thread::WorkerThread;
 use crate::registry::{Registry, XorShift64Star};
+use crate::scope::ScopeLatch;
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
@@ -228,23 +228,51 @@ impl<T> JobResult<T> {
     }
 }
 
-pub(super) struct FutureJob<L, F>
+pub(super) struct FutureHeapJob<'a, F: Future> {
+    future_job: FutureJob<'a, ScopeLatch, F>,
+}
+
+impl<'a, F: Future> FutureHeapJob<'a, F> {
+    pub(super) fn new(future: F, latch: &'a ScopeLatch) -> Self {
+        Self {
+            future_job: FutureJob::new(future, latch),
+        }
+    }
+
+    pub(super) unsafe fn as_job_ref(self: Pin<Box<Self>>) -> JobRef {
+        let this: *const Self = mem::transmute(self);
+        JobRef::new(this)
+    }
+}
+
+impl<'a, F: Future> Job for FutureHeapJob<'a, F> {
+    unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
+        let this: Pin<_> = mem::transmute::<_, Box<Self>>(this).into();
+        let future_job = &this.future_job;
+        let worker_thread = execution_context.worker_thread;
+
+        worker_thread.push(future_job.as_job_ref());
+        worker_thread.wait_until(future_job.latch);
+    }
+}
+
+pub(super) struct FutureJob<'a, L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    pub(super) latch: L,
+    pub(super) latch: &'a L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
     waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here on stack to avoid heap allocation
 }
 
-impl<L, F> FutureJob<L, F>
+impl<'a, L, F> FutureJob<'a, L, F>
 where
     L: Latch + Sync,
     F: Future,
 {
-    pub(super) fn new(future: F, latch: L) -> Self {
+    pub(super) fn new(future: F, latch: &'a L) -> Self {
         Self {
             latch,
             future: UnsafeCell::new(future),
@@ -376,7 +404,7 @@ impl FutureJobWaker {
     }
 }
 
-impl<L, F> Job for FutureJob<L, F>
+impl<'a, L, F> Job for FutureJob<'_, L, F>
 where
     L: Latch + Sync,
     F: Future,
