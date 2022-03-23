@@ -316,10 +316,10 @@ impl FutureJobWaker {
             .expect("Deque ID should have been in stealables mapping, but was not found");
         let (_, deque_state, stealable_set_index) = *lock.value_mut();
 
-        assert!(
-            deque_state == DequeState::Suspended,
-            "Future triggered waker, but deque {:?} this future belongs to was not marked as Suspended (marked {:?})", self.suspended_deque_id, deque_state
-        );
+        // Return early if another waker instance has already unsuspended this deque
+        if deque_state != DequeState::Suspended {
+            return;
+        }
 
         let registry = unsafe { &*self.registry };
 
