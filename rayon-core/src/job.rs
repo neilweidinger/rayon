@@ -12,6 +12,7 @@ use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 use std::task::{Context, Poll, RawWaker, RawWakerVTable, Waker};
 
@@ -59,6 +60,7 @@ pub(super) trait Job {
 pub(super) struct JobRef {
     pointer: *const (),
     execute_fn: for<'a> unsafe fn(*const (), ExecutionContext<'a>),
+    scheduled: Option<*const AtomicBool>,
 }
 
 unsafe impl Send for JobRef {}
@@ -67,7 +69,7 @@ unsafe impl Sync for JobRef {}
 impl JobRef {
     /// Unsafe: caller asserts that `data` will remain valid until the
     /// job is executed.
-    pub(super) unsafe fn new<T>(data: *const T) -> JobRef
+    pub(super) unsafe fn new<T>(data: *const T, scheduled: Option<*const AtomicBool>) -> JobRef
     where
         T: Job,
     {
@@ -77,6 +79,7 @@ impl JobRef {
         JobRef {
             pointer: data as *const (),
             execute_fn: mem::transmute(fn_ptr),
+            scheduled,
         }
     }
 
@@ -124,7 +127,7 @@ where
     }
 
     pub(super) unsafe fn as_job_ref(&self) -> JobRef {
-        JobRef::new(self)
+        JobRef::new(self, None)
     }
 
     pub(super) unsafe fn run_inline(self, stolen: bool) -> R {
@@ -197,7 +200,7 @@ where
     /// doesn't outlive any data that it closes over.
     pub(super) unsafe fn as_job_ref(self: Box<Self>) -> JobRef {
         let this: *const Self = mem::transmute(self);
-        JobRef::new(this)
+        JobRef::new(this, None)
     }
 }
 
@@ -238,8 +241,9 @@ impl<'a, F: Future> FutureHeapJob<'a, F> {
     }
 
     pub(super) unsafe fn as_job_ref(self: Pin<Box<Self>>) -> JobRef {
+        let scheduled = Some(&self.future_job.scheduled as *const AtomicBool);
         let this: *const Self = mem::transmute(self);
-        JobRef::new(this)
+        JobRef::new(this, scheduled)
     }
 }
 
@@ -263,6 +267,7 @@ where
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
     waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here within FutureJob to avoid heap allocation
+    scheduled: AtomicBool,
 }
 
 impl<'a, L, F> FutureJob<'a, L, F>
@@ -276,11 +281,12 @@ where
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
             waker: UnsafeCell::new(None),
+            scheduled: AtomicBool::new(true), // assumed this FutureJob will be immediately scheduled
         }
     }
 
     pub(super) unsafe fn as_job_ref(&self) -> JobRef {
-        JobRef::new(self)
+        JobRef::new(self, Some(&self.scheduled as *const AtomicBool))
     }
 
     pub(super) unsafe fn into_result(self) -> F::Output {
@@ -309,17 +315,18 @@ impl FutureJobWaker {
         // Suspended, moving it to the bench, etc.)
         while !self.latch.probe() {}
 
+        let ab = unsafe { &*self.suspended_job_ref.scheduled.unwrap() };
+        if ab.load(Ordering::SeqCst) {
+            return;
+        }
+        ab.store(true, Ordering::SeqCst);
+
         // Get the current (and soon to be replaced) state of the deque. Use this to later check if
         // deque needs to be moved into a stealable set or not.
         let mut lock = stealables
             .get_lock(self.suspended_deque_id)
             .expect("Deque ID should have been in stealables mapping, but was not found");
-        let (_, deque_state, stealable_set_index) = *lock.value_mut();
-
-        // Return early if another waker instance has already unsuspended this deque
-        if deque_state != DequeState::Suspended {
-            return;
-        }
+        let (_, _, stealable_set_index) = *lock.value_mut();
 
         let registry = unsafe { &*self.registry };
 
@@ -331,13 +338,12 @@ impl FutureJobWaker {
         let deque_worker = registry
             .deque_bench()
             .get_mut(&self.suspended_deque_id)
-            .expect(
-                format!(
+            .unwrap_or_else(|| {
+                panic!(
                     "Suspended deque {:?} not found in deque bench",
                     self.suspended_deque_id
                 )
-                .as_str(),
-            );
+            });
         deque_worker.push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
@@ -410,6 +416,10 @@ where
     unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
         let this = &*this;
         let abort = unwind::AbortIfPanic;
+
+        this.scheduled
+            .compare_exchange(true, false, Ordering::SeqCst, Ordering::SeqCst)
+            .expect("NOT GOOD");
 
         let worker_thread = execution_context.worker_thread;
         let stealables = execution_context.worker_thread.stealables();
@@ -536,7 +546,7 @@ impl JobFifo {
         // jobs in a thread's deque may be popped from the back (LIFO) or stolen from the front
         // (FIFO), but either way they will end up popping from the front of this queue.
         self.inner.push(job_ref);
-        JobRef::new(self)
+        JobRef::new(self, None)
     }
 }
 
