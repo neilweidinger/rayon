@@ -328,7 +328,7 @@ impl FutureJobWaker {
         // deque here when the future wakes up, as opposed to proactively pushing it when the
         // blocked future is first encountered, ensures that a deque only ever contains
         // non-suspended jobs, which simplifies the stealing implemenrtation.
-        let deque_worker = registry
+        registry
             .deque_bench()
             .get_mut(&self.suspended_deque_id)
             .unwrap_or_else(|| {
@@ -336,8 +336,8 @@ impl FutureJobWaker {
                     "Suspended deque {:?} not found in deque bench",
                     self.suspended_deque_id
                 )
-            });
-        deque_worker.push(self.suspended_job_ref);
+            })
+            .push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
         stealables.update_deque_state(

@@ -124,10 +124,18 @@ impl WorkerThread {
         let active_deque = unsafe { &mut *self.active_deque.get() }.as_mut().unwrap();
         let queue_was_empty = active_deque.is_empty();
         active_deque.push(job);
+
+        self.stealables.add_existing_deque_to_stealable_set(
+            None,
+            self.index,
+            unsafe { &*self.active_deque.get() }.as_ref().unwrap().id(),
+        );
+
         self.log(|| JobPushed {
             worker: self.index,
             deque_id: active_deque.id(),
         });
+
         self.registry
             .sleep
             .new_internal_jobs(self.index, 1, queue_was_empty);
