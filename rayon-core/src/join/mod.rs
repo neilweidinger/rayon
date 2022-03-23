@@ -166,39 +166,6 @@ where
 }
 
 /// TODO: docs
-pub fn join_async<A, B>(future_a: A, future_b: B) -> (<A as Future>::Output, <B as Future>::Output)
-where
-    A: Future + Send,
-    B: Future + Send,
-    <A as Future>::Output: Send,
-    <B as Future>::Output: Send,
-{
-    registry::in_worker(|worker_thread, _| unsafe {
-        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
-        // Future gets moved into above mentioned job and lives there.
-        // TODO: make pinning on stack more explicit using something like pin_mut! or something
-        let job_b_latch = SpinLatch::new(worker_thread);
-        let job_b = FutureJob::new(future_b, &job_b_latch);
-        let job_b_ref = job_b.as_job_ref();
-        worker_thread.push(job_b_ref);
-
-        // Job lives here on stack, only after latch is set and we know job is completed does the stack get cleaned up.
-        // Future gets moved into above mentioned job and lives there.
-        // TODO: make pinning on stack more explicit using something like pin_mut! or something
-        let job_a_latch = SpinLatch::new(worker_thread);
-        let job_a = FutureJob::new(future_a, &job_a_latch);
-        let job_a_ref = job_a.as_job_ref();
-        worker_thread.push(job_a_ref);
-
-        worker_thread.wait_until(job_a.latch); // Wait on job a latch first, since job a will be popped before job b and correspondingly have its latch set first
-        worker_thread.wait_until(job_b.latch);
-        debug_assert!(job_a.latch.probe() && job_b.latch.probe());
-
-        (job_a.into_result(), job_b.into_result())
-    })
-}
-
-/// TODO: docs
 pub fn spawn_blocking_future<A>(future: A) -> <A as Future>::Output
 where
     A: Future + Send,

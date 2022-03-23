@@ -77,7 +77,7 @@ mod unwind;
 mod compile_fail;
 mod test;
 
-pub use self::join::{join, join_async, join_context, spawn_blocking_future};
+pub use self::join::{join, join_context, spawn_blocking_future};
 pub use self::registry::ThreadBuilder;
 pub use self::scope::{in_place_scope, scope, Scope};
 pub use self::scope::{in_place_scope_fifo, scope_fifo, ScopeFifo};
