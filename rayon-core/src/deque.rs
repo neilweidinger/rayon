@@ -427,22 +427,25 @@ impl Stealables {
     /// This method takes care of a deque in a stealable set that is empty (has no jobs to
     /// execute). This is done here, so that we can take advantage of the internal DashMap lock.
     /// Returns true if deque is empty.
-    pub(super) fn handle_empty_deque(&self, deque_id: DequeId) -> bool {
+    pub(super) fn handle_empty_deque(&self, index: ThreadIndex, deque_id: DequeId) -> bool {
         let mut lock = self
             .get_lock(deque_id)
             .expect("Deque ID should have been in stealables mapping, but was not found");
-        let (deque_stealer, deque_state, _) = lock.value_mut();
+        let (deque_stealer, deque_state, stealable_set_index) = lock.value_mut();
         let deque_state = *deque_state;
 
         if deque_stealer.is_empty() {
             self.registry.as_ref().log(|| HandlingEmptyDeque {
+                thread_doing_handling: index,
+                stealable_set_index: *stealable_set_index,
                 deque_id,
                 deque_state,
             });
 
             // This deque is empty and has no jobs to be stolen from, so remove it from
             // its stealable set
-            let index = self.remove_deque_from_stealable_set(Some(&mut lock), deque_id);
+            let removed_thread_index =
+                self.remove_deque_from_stealable_set(Some(&mut lock), deque_id);
 
             // If the deque is not Suspended (Suspended deque can be empty but awaiting
             // suspended future to awake) but is empty, we should destroy/free the
@@ -457,13 +460,15 @@ impl Stealables {
             // stealable set. This is because another thread could have removed this deque from its
             // stealable set before this thread had a chance to, and if so there is no need for
             // this thread to perform rebalancing.
-            if let Ok(index) = index {
+            if let Ok(index) = removed_thread_index {
                 self.rebalance_stealables(Some(&mut lock), index);
             }
 
             true
         } else {
             self.registry.as_ref().log(|| HandlingEmptyDequeNotEmpty {
+                thread_doing_handling: index,
+                stealable_set_index: *stealable_set_index,
                 deque_id,
                 deque_state,
             });

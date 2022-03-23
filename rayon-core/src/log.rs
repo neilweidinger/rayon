@@ -35,26 +35,31 @@ pub(super) enum Event {
 
     /// Indicates that a worker thread started execution.
     ThreadStart {
-        worker: usize,
+        worker: ThreadIndex,
         terminate_addr: usize,
     },
 
     /// Indicates that a worker thread terminated execution.
     ThreadTerminate {
-        worker: usize,
+        worker: ThreadIndex,
     },
 
     /// Indicates that a worker thread became idle, blocked on `latch_addr`.
     ThreadIdle {
-        worker: usize,
+        worker: ThreadIndex,
         latch_addr: usize,
     },
 
     /// Indicates that an idle worker thread found work to do, after
     /// yield rounds. It should no longer be considered idle.
     ThreadFoundWork {
-        worker: usize,
+        worker: ThreadIndex,
         yields: u32,
+    },
+
+    /// Idle worker thread did not find work
+    ThreadDidNotFindWork {
+        worker: ThreadIndex,
     },
 
     /// Indicates that a worker blocked on a latch observed that it was set.
@@ -62,14 +67,14 @@ pub(super) enum Event {
     /// Internal debugging event that does not affect the state
     /// machine.
     ThreadSawLatchSet {
-        worker: usize,
+        worker: ThreadIndex,
         latch_addr: usize,
     },
 
     /// Indicates that an idle worker is getting sleepy. `sleepy_counter` is the internal
     /// sleep state that we saw at the time.
     ThreadSleepy {
-        worker: usize,
+        worker: ThreadIndex,
         jobs_counter: usize,
     },
 
@@ -77,7 +82,7 @@ pub(super) enum Event {
     /// interrupted because the latch was set. (This is not, in and of
     /// itself, a change to the thread state.)
     ThreadSleepInterruptedByLatch {
-        worker: usize,
+        worker: ThreadIndex,
         latch_addr: usize,
     },
 
@@ -85,25 +90,25 @@ pub(super) enum Event {
     /// interrupted because a job was posted. (This is not, in and of
     /// itself, a change to the thread state.)
     ThreadSleepInterruptedByJob {
-        worker: usize,
+        worker: ThreadIndex,
     },
 
     /// Indicates that an idle worker has gone to sleep.
     ThreadSleeping {
-        worker: usize,
+        worker: ThreadIndex,
         latch_addr: usize,
     },
 
     /// Indicates that a sleeping worker has awoken.
     ThreadAwoken {
-        worker: usize,
+        worker: ThreadIndex,
         latch_addr: usize,
     },
 
     /// Indicates that the given worker thread was notified it should
     /// awaken.
     ThreadNotify {
-        worker: usize,
+        worker: ThreadIndex,
     },
 
     /// Indicates that a waker was triggered
@@ -111,7 +116,7 @@ pub(super) enum Event {
     /// stealable_set_index: stealable set the deque was already in
     WakerAwoken {
         suspended_deque_id: DequeId,
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
     },
 
     /// Indicates that a waker was triggered, and the deque was added to a stealable set (as
@@ -120,7 +125,7 @@ pub(super) enum Event {
     /// stealable_set_index: stealable set the deque was added to
     WakerAwokenAndDequeInserted {
         suspended_deque_id: DequeId,
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
     },
 
     /// Indicates that a FutureJob was executed and returned Poll::Ready.
@@ -137,51 +142,68 @@ pub(super) enum Event {
 
     /// The given worker has pushed a job to its local deque.
     JobPushed {
-        worker: usize,
+        worker: ThreadIndex,
         deque_id: DequeId,
     },
 
     /// The given worker has popped a job from its local deque.
     JobPopped {
-        worker: usize,
+        worker: ThreadIndex,
         deque_id: DequeId,
+        jobs_remaining: usize,
+    },
+
+    /// The given worker has failed to pop a job from its local deque.
+    JobPoppedFailed {
+        worker: ThreadIndex,
+        deque_id: DequeId,
+        jobs_remaining: usize,
     },
 
     /// The given worker has successfully stolen a job from the deque of another.
     JobStolen {
         attempt: usize,
-        worker: usize,
-        victim_thread: usize,
+        worker: ThreadIndex,
+        victim_thread: ThreadIndex,
         victim_deque_id: DequeId,
         deque_state: DequeState,
     },
 
-    /// The given worker attempted to steal a job, but failed.
-    JobStolenFail {
+    /// The given worker attempted to steal a job, but failed because the stealer was empty
+    JobStolenFailEmpty {
         attempt: usize,
-        worker: usize,
-        victim_thread: usize,
+        worker: ThreadIndex,
+        victim_thread: ThreadIndex,
+        victim_deque_id: DequeId,
+        deque_state: DequeState,
+    },
+
+    /// The given worker attempted to steal a job, but failed because the stealer returned Retry
+    JobStolenFailRetry {
+        attempt: usize,
+        worker: ThreadIndex,
+        victim_thread: ThreadIndex,
         victim_deque_id: DequeId,
         deque_state: DequeState,
     },
 
     NewDequeAddedToStealableSet {
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
         deque_id: DequeId,
     },
 
     ExistingDequeAddedToStealableSet {
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
         deque_id: DequeId,
     },
 
     DequeRemovedFromStealableSet {
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
         deque_id: DequeId,
     },
 
     DequeRemovedFromStealableSetFailed {
-        stealable_set_index: usize,
+        stealable_set_index: ThreadIndex,
         deque_id: DequeId,
     },
 
@@ -196,18 +218,28 @@ pub(super) enum Event {
 
     RebalanceStealables {
         attempt: usize,
-        thread_index: usize,
-        victim_index: usize,
+        thread_index: ThreadIndex,
+        victim_index: ThreadIndex,
     },
 
     HandlingEmptyDeque {
+        thread_doing_handling: ThreadIndex,
+        stealable_set_index: Option<ThreadIndex>,
         deque_id: DequeId,
         deque_state: DequeState,
     },
 
     HandlingEmptyDequeNotEmpty {
+        thread_doing_handling: ThreadIndex,
+        stealable_set_index: Option<ThreadIndex>,
         deque_id: DequeId,
         deque_state: DequeState,
+    },
+
+    SettingToActive {
+        worker: ThreadIndex,
+        victim_thread: ThreadIndex,
+        victim_deque_id: DequeId,
     },
 
     /// N jobs were injected into the global queue.
@@ -217,14 +249,14 @@ pub(super) enum Event {
 
     /// A job was removed from the global queue.
     JobUninjected {
-        worker: usize,
+        worker: ThreadIndex,
     },
 
     /// When announcing a job, this was the value of the counters we observed.
     ///
     /// No effect on thread state, just a debugging event.
     JobThreadCounts {
-        worker: usize,
+        worker: ThreadIndex,
         num_idle: u16,
         num_sleepers: u16,
     },

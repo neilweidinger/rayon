@@ -262,7 +262,7 @@ where
     pub(super) latch: &'a L,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
-    waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here on stack to avoid heap allocation
+    waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here within FutureJob to avoid heap allocation
 }
 
 impl<'a, L, F> FutureJob<'a, L, F>
@@ -414,25 +414,18 @@ where
         let worker_thread = execution_context.worker_thread;
         let stealables = execution_context.worker_thread.stealables();
 
-        let active_deque = {
-            // It's possible that this thread has no active deque if it is early during
-            // Rayon setup and an active deque has not been allocated for this worker
-            // thread
-            if { &mut *worker_thread.active_deque().get() }.is_none() {
-                worker_thread.create_new_active_deque();
-            }
-
-            &mut *worker_thread.active_deque().get()
-        }
-        .take() // Set active deque for worker thread to None so that thread steals on next round
-        .expect("Worker thread executing a job erroneously has no active deque");
+        let active_deque = &mut *worker_thread.active_deque().get();
+        let active_deque_id = active_deque
+            .as_ref()
+            .expect("Worker thread executing a job erroneously has no active deque")
+            .id();
 
         // Get the ID of the deque this FutureJob is in, since it may return pending and this deque
         // will become suspended, and the waker will need to know the ID of this deque in order to
         // mark it resumable
         let future_job_waker = FutureJobWaker {
             stealables,
-            suspended_deque_id: active_deque.id(),
+            suspended_deque_id: active_deque_id,
             registry: worker_thread.registry(),
             suspended_job_ref: this.as_job_ref(),
             latch: CoreLatch::new(),
@@ -455,7 +448,7 @@ where
         let execute_poll = || match pinned_future.poll(&mut context) {
             Poll::Ready(x) => {
                 worker_thread.registry().log(|| Event::FutureJobReady {
-                    deque_id: active_deque.id(),
+                    deque_id: active_deque_id,
                     executing_worker_thread: worker_thread.index(),
                 });
 
@@ -464,19 +457,23 @@ where
             }
             Poll::Pending => {
                 worker_thread.registry().log(|| Event::FutureJobPending {
-                    deque_id: active_deque.id(),
+                    deque_id: active_deque_id,
                     executing_worker_thread: worker_thread.index(),
                 });
 
+                let active_deque = active_deque
+                    .take() // Set active deque for worker thread to None so that thread steals on next round
+                    .expect("Worker thread executing a job erroneously has no active deque");
+
                 // Mark deque as suspended
                 // TODO: get Stealables lock for here and other operations below?
-                stealables.update_deque_state(None, active_deque.id(), DequeState::Suspended);
+                stealables.update_deque_state(None, active_deque_id, DequeState::Suspended);
 
                 // Remove deque from stealable set to prevent being stolen from; we will add to a
                 // random stealable set if we see the deque contains other non-suspended jobs. If
                 // it does not, and contains only the one suspended job, this deque will not be
                 // found in any stealable set and as such will not be able to be stolen from.
-                let _ = stealables.remove_deque_from_stealable_set(None, active_deque.id());
+                let _ = stealables.remove_deque_from_stealable_set(None, active_deque_id);
 
                 // If the deque contains non-suspended jobs, it still contains work and can be
                 // stolen from. As such add it to a random victim's stealable set (random victim
@@ -488,22 +485,22 @@ where
                     stealables.add_existing_deque_to_stealable_set(
                         None,
                         random_victim_index,
-                        active_deque.id(),
+                        active_deque_id,
                     );
                 }
 
                 // Move ex-active deque to the bench, so that it can live somewhere (the deque must
                 // not be dropped, since it will be resumed again later when the future completes).
-                // There should not already be a deque with the same ID in the bench, if so panic.
-                assert!(
-                    worker_thread
-                        .registry()
-                        .deque_bench()
-                        .insert(active_deque.id(), active_deque)
-                        .is_none(),
-                    "When moving active deque to bench, bench already contained a deque with the
-                    same ID"
-                );
+                // It is possible for this deque to already be in the bench if this is a nested
+                // future (when we poll the outer future, the inner future(s) also gets polled, and
+                // thus the innermost future reaches this point in the `execute` method first,
+                // inserting it into the bench, meaning the outer future does not have to move it
+                // to the bench).
+                worker_thread
+                    .registry()
+                    .deque_bench()
+                    .entry(active_deque_id)
+                    .or_insert_with(|| active_deque);
 
                 // Only once we reach here and all the above pending future logic is completed is
                 // the waker allowed to proceed. This is to prevent cases such as where without the

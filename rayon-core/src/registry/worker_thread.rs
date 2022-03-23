@@ -161,6 +161,13 @@ impl WorkerThread {
             self.log(|| JobPopped {
                 worker: self.index,
                 deque_id: active_deque.id(),
+                jobs_remaining: active_deque.len(),
+            });
+        } else {
+            self.log(|| JobPoppedFailed {
+                worker: self.index,
+                deque_id: active_deque.id(),
+                jobs_remaining: active_deque.len(),
             });
         }
 
@@ -206,6 +213,7 @@ impl WorkerThread {
                 }
                 idle_state = self.registry.sleep.start_looking(self.index, latch);
             } else {
+                self.log(|| ThreadDidNotFindWork { worker: self.index });
                 self.registry
                     .sleep
                     .no_work_found(&mut idle_state, latch, || self.registry.has_injected_job())
@@ -348,7 +356,9 @@ impl WorkerThread {
                 // marked resumable this means there are more jobs in the deque also waiting to be
                 // executed, so we mark this deque as muggable so that another thread can mug this
                 // entire deque in the future.
-                if !self.stealables.handle_empty_deque(victim_deque_id)
+                if !self
+                    .stealables
+                    .handle_empty_deque(self.index, victim_deque_id)
                     && deque_state == DequeState::Resumable
                 {
                     // TODO: should we use a lock here?
@@ -380,8 +390,19 @@ impl WorkerThread {
                         // the next scheduling round anyway so just return it directly here
                         Some(job)
                     }
-                    Steal::Empty | Steal::Retry => {
-                        self.log(|| JobStolenFail {
+                    Steal::Empty => {
+                        self.log(|| JobStolenFailEmpty {
+                            attempt,
+                            worker: self.index,
+                            victim_thread,
+                            victim_deque_id,
+                            deque_state,
+                        });
+
+                        None
+                    }
+                    Steal::Retry => {
+                        self.log(|| JobStolenFailRetry {
                             attempt,
                             worker: self.index,
                             victim_thread,
@@ -409,6 +430,12 @@ impl WorkerThread {
     ) -> Option<JobRef> {
         // Enter protected atomic section
         let _guard = self.set_to_active_lock.lock();
+
+        self.log(|| SettingToActive {
+            worker: self.index,
+            victim_thread,
+            victim_deque_id,
+        });
 
         // We have entered the protected atomic section. It could be possible that another thread
         // has already mugged this deque before we had a chance, so quickly check the deque state
