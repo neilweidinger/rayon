@@ -331,13 +331,12 @@ impl FutureJobWaker {
         let deque_worker = registry
             .deque_bench()
             .get_mut(&self.suspended_deque_id)
-            .expect(
-                format!(
+            .unwrap_or_else(|| {
+                panic!(
                     "Suspended deque {:?} not found in deque bench",
                     self.suspended_deque_id
                 )
-                .as_str(),
-            );
+            });
         deque_worker.push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
@@ -461,19 +460,28 @@ where
                     executing_worker_thread: worker_thread.index(),
                 });
 
+                let mut lock = stealables
+                    .get_lock(active_deque_id)
+                    .expect("Deque ID should have been in stealables mapping, but was not found");
+
                 let active_deque = active_deque
                     .take() // Set active deque for worker thread to None so that thread steals on next round
                     .expect("Worker thread executing a job erroneously has no active deque");
 
                 // Mark deque as suspended
                 // TODO: get Stealables lock for here and other operations below?
-                stealables.update_deque_state(None, active_deque_id, DequeState::Suspended);
+                stealables.update_deque_state(
+                    Some(&mut lock),
+                    active_deque_id,
+                    DequeState::Suspended,
+                );
 
                 // Remove deque from stealable set to prevent being stolen from; we will add to a
                 // random stealable set if we see the deque contains other non-suspended jobs. If
                 // it does not, and contains only the one suspended job, this deque will not be
                 // found in any stealable set and as such will not be able to be stolen from.
-                let _ = stealables.remove_deque_from_stealable_set(None, active_deque_id);
+                let _ =
+                    stealables.remove_deque_from_stealable_set(Some(&mut lock), active_deque_id);
 
                 // If the deque contains non-suspended jobs, it still contains work and can be
                 // stolen from. As such add it to a random victim's stealable set (random victim
@@ -483,7 +491,7 @@ where
                         RNG.with(|rng| rng.next_usize(stealables.get_num_threads()));
 
                     stealables.add_existing_deque_to_stealable_set(
-                        None,
+                        Some(&mut lock),
                         random_victim_index,
                         active_deque_id,
                     );
