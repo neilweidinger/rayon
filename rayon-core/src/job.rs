@@ -1,13 +1,13 @@
 use crate::deque::{DequeId, DequeState, Stealables, ThreadIndex};
-use crate::latch::{CoreLatch, Latch};
+use crate::latch::{AsCoreLatch, CoreLatch, Latch, LockLatch, SpinLatch};
 use crate::log::Event;
 use crate::registry::worker_thread::WorkerThread;
-use crate::registry::{Registry, XorShift64Star};
-use crate::scope::ScopeLatch;
+use crate::registry::{global_registry, Registry, XorShift64Star};
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
 use std::cell::UnsafeCell;
+use std::fmt;
 use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
@@ -19,6 +19,25 @@ pub(super) enum JobResult<T> {
     None,
     Ok(T),
     Panic(Box<dyn Any + Send>),
+}
+
+impl<T> JobResult<T> {
+    /// Convert the `JobResult` for a job that has finished (and hence
+    /// its JobResult is populated) into its return value.
+    ///
+    /// NB. This will panic if the job panicked.
+    #[must_use]
+    pub(super) fn into_return_value(self) -> T {
+        match self {
+            JobResult::None => unreachable!(),
+            JobResult::Ok(x) => x,
+            JobResult::Panic(x) => unwind::resume_unwinding(x),
+        }
+    }
+
+    fn take(&mut self) -> JobResult<T> {
+        mem::replace(self, JobResult::None)
+    }
 }
 
 pub(super) struct ExecutionContext<'a> {
@@ -212,79 +231,209 @@ where
     }
 }
 
-impl<T> JobResult<T> {
-    /// Convert the `JobResult` for a job that has finished (and hence
-    /// its JobResult is populated) into its return value.
-    ///
-    /// NB. This will panic if the job panicked.
-    pub(super) fn into_return_value(self) -> T {
+// pub(super) struct FutureHeapJob<'a, F: Future> {
+//     future_job: FutureJob<'a, ScopeLatch, F>,
+// }
+
+// impl<'a, F: Future> FutureHeapJob<'a, F> {
+//     pub(super) fn new(future: F, latch: &'a ScopeLatch) -> Self {
+//         Self {
+//             future_job: FutureJob::new(future, latch),
+//         }
+//     }
+
+//     pub(super) unsafe fn as_job_ref(self: Pin<Box<Self>>) -> JobRef {
+//         let this: *const Self = mem::transmute(self);
+//         JobRef::new(this)
+//     }
+// }
+
+// impl<'a, F: Future> Job for FutureHeapJob<'a, F> {
+//     unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
+//         let this: Pin<_> = mem::transmute::<_, Box<Self>>(this).into();
+//         let future_job = &this.future_job;
+//         let worker_thread = execution_context.worker_thread;
+
+//         worker_thread.push(future_job.as_job_ref());
+//         worker_thread.wait_until(future_job.latch);
+//     }
+// }
+
+enum FutureJobLatch<'r> {
+    SpinLatch(SpinLatch<'r>), // used if we are on a worker thread
+    LockLatch(LockLatch),     // used if we are not on a worker thread, just block
+}
+
+impl<'r> Latch for FutureJobLatch<'r> {
+    fn set(&self) {
         match self {
-            JobResult::None => unreachable!(),
-            JobResult::Ok(x) => x,
-            JobResult::Panic(x) => unwind::resume_unwinding(x),
+            FutureJobLatch::SpinLatch(spin_latch) => spin_latch.set(),
+            FutureJobLatch::LockLatch(lock_latch) => lock_latch.set(),
         }
     }
 }
 
-pub(super) struct FutureHeapJob<'a, F: Future> {
-    future_job: FutureJob<'a, ScopeLatch, F>,
-}
-
-impl<'a, F: Future> FutureHeapJob<'a, F> {
-    pub(super) fn new(future: F, latch: &'a ScopeLatch) -> Self {
-        Self {
-            future_job: FutureJob::new(future, latch),
-        }
-    }
-
-    pub(super) unsafe fn as_job_ref(self: Pin<Box<Self>>) -> JobRef {
-        let this: *const Self = mem::transmute(self);
-        JobRef::new(this)
-    }
-}
-
-impl<'a, F: Future> Job for FutureHeapJob<'a, F> {
-    unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
-        let this: Pin<_> = mem::transmute::<_, Box<Self>>(this).into();
-        let future_job = &this.future_job;
-        let worker_thread = execution_context.worker_thread;
-
-        worker_thread.push(future_job.as_job_ref());
-        worker_thread.wait_until(future_job.latch);
-    }
-}
-
-pub(super) struct FutureJob<'a, L, F>
+/// TODO: Docs
+pub struct FutureJob<'r, F>
 where
-    L: Latch + Sync,
     F: Future,
 {
-    pub(super) latch: &'a L,
+    latch: FutureJobLatch<'r>,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
     waker: UnsafeCell<Option<FutureJobWaker>>, // store waker *data* here within FutureJob to avoid heap allocation
 }
 
-impl<'a, L, F> FutureJob<'a, L, F>
+impl<'r, F> FutureJob<'r, F>
 where
-    L: Latch + Sync,
     F: Future,
 {
-    pub(super) fn new(future: F, latch: &'a L) -> Self {
+    /// TODO: Docs
+    pub fn new(future: F) -> Self {
         Self {
-            latch,
+            latch: {
+                if let Some(worker_thread) = global_registry().current_thread() {
+                    FutureJobLatch::SpinLatch(SpinLatch::new(worker_thread))
+                } else {
+                    FutureJobLatch::LockLatch(LockLatch::new())
+                }
+            },
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
             waker: UnsafeCell::new(None),
         }
     }
 
-    pub(super) unsafe fn as_job_ref(&self) -> JobRef {
-        JobRef::new(self)
+    /// TODO: Docs
+    // Take self using a pinned exclusive reference, not shared reference, since if using a shared
+    // reference Pin becomes Copy, but here we want to consume the Pin
+    pub fn spawn<'a>(self: Pin<&'a mut Self>) -> FutureJobHandle<'r, F>
+    where
+        'a: 'r,
+    {
+        let job_ref = unsafe { self.as_job_ref() };
+        let registry = &Registry::current();
+
+        // Ensure that registry cannot terminate until FutureJob has completed. This reference is
+        // decremented when our FutureJob is finished.
+        registry.increment_terminate_count();
+
+        match &self.latch {
+            FutureJobLatch::SpinLatch(_) => {
+                // If we are on a worker thread, push onto its deque. Note that we don't just
+                // directly execute inline here, as `spawn` is meant to express parallelism (we
+                // "fire off" a FutureJob to be executed, hopefully in parallel if another thread
+                // manages to steal the job).
+                registry.inject_or_push(job_ref);
+            }
+            FutureJobLatch::LockLatch(_) => {
+                // If we are on not a worker thread, spawn a regular job that will be execute on a
+                // worker thread in the pool and set our LockLatch when the FutureJob is completed.
+                let future_job_ref = unsafe { self.as_job_ref() };
+
+                // `move` is critical here: we need to make sure `future_job_ref` is moved,
+                // otherwise it will just use a reference to the local variable above that will go
+                // out of scope (dangling reference)
+                let spawn_job = Box::new(HeapJob::new(move || {
+                    let worker_thread = unsafe {
+                        let worker_thread = WorkerThread::current();
+                        assert!(!worker_thread.is_null());
+                        &*worker_thread
+                    };
+
+                    unsafe {
+                        worker_thread.execute(future_job_ref);
+                    }
+                }));
+
+                registry.inject(&[unsafe { spawn_job.as_job_ref() }]);
+            }
+        };
+
+        FutureJobHandle {
+            pinned_future_job: self,
+        }
     }
 
-    pub(super) unsafe fn into_result(self) -> F::Output {
-        self.result.into_inner().into_return_value()
+    // Spawn a future (i.e. poll it for the first time) inline, if we know we are on a worker
+    // thread. We still return a FutureJobHandle, as a future may suspend and only resume later, so
+    // we must await the FutureJobHandle if we want to guarantee completion of the future.
+    pub(super) fn spawn_inline<'a>(
+        self: Pin<&'a mut Self>,
+        worker_thread: &WorkerThread,
+    ) -> FutureJobHandle<'r, F>
+    where
+        'a: 'r,
+    {
+        // Ensure that registry cannot terminate until FutureJob has completed. This reference is
+        // decremented when our FutureJob is finished.
+        Registry::current().increment_terminate_count();
+
+        unsafe {
+            let future_job_ref = self.as_job_ref();
+            worker_thread.execute(future_job_ref);
+        }
+
+        FutureJobHandle {
+            pinned_future_job: self,
+        }
+    }
+
+    unsafe fn as_job_ref(&self) -> JobRef {
+        JobRef::new(self)
+    }
+}
+
+impl<'r, F> fmt::Debug for FutureJob<'r, F>
+where
+    F: Future,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("FutureJob").finish_non_exhaustive()
+    }
+}
+
+/// TODO: Docs
+pub struct FutureJobHandle<'a, F>
+where
+    F: Future,
+{
+    pinned_future_job: Pin<&'a mut FutureJob<'a, F>>,
+}
+
+impl<'a, F> FutureJobHandle<'a, F>
+where
+    F: Future,
+{
+    /// TODO: Docs
+    pub fn await_future_job(self) -> <F as Future>::Output {
+        match &self.pinned_future_job.latch {
+            FutureJobLatch::SpinLatch(spin_latch) => {
+                // This FutureJob was created on a worker thread (in call to `new`), so we know we
+                // can just directly run the scheduling loop to execute the FutureJob here, as we
+                // are awaiting
+                let worker_thread = unsafe { WorkerThread::current().as_ref() }.unwrap();
+                worker_thread.wait_until(spin_latch);
+
+                debug_assert!(spin_latch.as_core_latch().probe());
+            }
+            FutureJobLatch::LockLatch(lock_latch) => {
+                lock_latch.wait();
+            }
+        }
+
+        unsafe { &mut *self.pinned_future_job.result.get() }
+            .take()
+            .into_return_value()
+    }
+}
+
+impl<'r, F> fmt::Debug for FutureJobHandle<'r, F>
+where
+    F: Future,
+{
+    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
+        fmt.debug_struct("FutureJobHandle").finish_non_exhaustive()
     }
 }
 
@@ -401,9 +550,8 @@ impl FutureJobWaker {
     }
 }
 
-impl<'a, L, F> Job for FutureJob<'_, L, F>
+impl<'a, F> Job for FutureJob<'_, F>
 where
-    L: Latch + Sync,
     F: Future,
 {
     unsafe fn execute(this: *const Self, execution_context: ExecutionContext<'_>) {
@@ -453,6 +601,9 @@ where
 
                 *(this.result.get()) = JobResult::Ok(x);
                 this.latch.set();
+
+                // permit registry to terminate, matching decrement for the increment when we spawned the FutureJob
+                Registry::current().terminate();
             }
             Poll::Pending => {
                 worker_thread.registry().log(|| Event::FutureJobPending {

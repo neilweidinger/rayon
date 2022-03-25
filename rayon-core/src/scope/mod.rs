@@ -5,14 +5,13 @@
 //! [`in_place_scope()`]: fn.in_place_scope.html
 //! [`join()`]: ../join/join.fn.html
 
-use crate::job::{FutureHeapJob, HeapJob, JobFifo};
+use crate::job::{HeapJob, JobFifo};
 use crate::latch::{AsCoreLatch, CoreLatch, CountLatch, CountLockLatch, Latch};
 use crate::registry::worker_thread::WorkerThread;
 use crate::registry::{global_registry, in_worker, Registry};
 use crate::unwind;
 use std::any::Any;
 use std::fmt;
-use std::future::Future;
 use std::marker::PhantomData;
 use std::mem;
 use std::ptr;
@@ -555,19 +554,19 @@ impl<'scope> Scope<'scope> {
         self.base.registry.inject_or_push(job_ref);
     }
 
-    /// TODO: docs
-    pub fn spawn_future<FUT>(&self, future: FUT)
-    where
-        FUT: Future<Output = ()> + Send + 'scope,
-    {
-        self.base.increment();
+    // /// TODO: docs
+    // pub fn spawn_future<FUT>(&self, future: FUT)
+    // where
+    //     FUT: Future<Output = ()> + Send + 'scope,
+    // {
+    //     self.base.increment();
 
-        let job_ref = unsafe {
-            Box::pin(FutureHeapJob::new(future, &self.base.job_completed_latch)).as_job_ref()
-        };
+    //     let job_ref = unsafe {
+    //         Box::pin(FutureHeapJob::new(future, &self.base.job_completed_latch)).as_job_ref()
+    //     };
 
-        self.base.registry.inject_or_push(job_ref);
-    }
+    //     self.base.registry.inject_or_push(job_ref);
+    // }
 }
 
 impl<'scope> ScopeFifo<'scope> {

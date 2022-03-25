@@ -101,6 +101,10 @@ impl WorkerThread {
     #[inline]
     #[must_use]
     pub(crate) fn active_deque(&self) -> &UnsafeCell<Option<Deque>> {
+        if unsafe { &*self.active_deque.get() }.is_none() {
+            self.create_new_active_deque();
+        }
+
         &self.active_deque
     }
 
@@ -242,7 +246,7 @@ impl WorkerThread {
     }
 
     #[inline]
-    pub(super) unsafe fn execute(&self, job: JobRef) {
+    pub(crate) unsafe fn execute(&self, job: JobRef) {
         job.execute(ExecutionContext::new(self));
     }
 

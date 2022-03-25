@@ -117,5 +117,6 @@ pub use rayon_core::ThreadPoolBuilder;
 pub use rayon_core::{current_num_threads, current_thread_index};
 pub use rayon_core::{in_place_scope, scope, Scope};
 pub use rayon_core::{in_place_scope_fifo, scope_fifo, ScopeFifo};
-pub use rayon_core::{join, join_async, join_context, spawn_blocking_future};
+pub use rayon_core::{join, join_async, join_context};
 pub use rayon_core::{spawn, spawn_fifo};
+pub use rayon_core::{FutureJob, FutureJobHandle};
