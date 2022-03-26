@@ -236,6 +236,11 @@ pub(super) enum Event {
         deque_state: DequeState,
     },
 
+    HandlingEmptyDequeNotFound {
+        thread_doing_handling: ThreadIndex,
+        deque_id: DequeId,
+    },
+
     SettingToActive {
         worker: ThreadIndex,
         victim_thread: ThreadIndex,
