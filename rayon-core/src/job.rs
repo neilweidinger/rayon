@@ -2,7 +2,7 @@ use crate::deque::{DequeId, DequeState, Stealables, ThreadIndex};
 use crate::latch::{AsCoreLatch, CoreLatch, Latch, LockLatch, SpinLatch};
 use crate::log::Event;
 use crate::registry::worker_thread::WorkerThread;
-use crate::registry::{global_registry, Registry, XorShift64Star};
+use crate::registry::{Registry, XorShift64Star};
 use crate::unwind;
 use crossbeam_deque::{Injector, Steal};
 use std::any::Any;
@@ -278,6 +278,7 @@ pub struct FutureJob<'r, F>
 where
     F: Future,
 {
+    registry: Arc<Registry>,
     latch: FutureJobLatch<'r>,
     future: UnsafeCell<F>,
     result: UnsafeCell<JobResult<F::Output>>,
@@ -290,14 +291,17 @@ where
 {
     /// TODO: Docs
     pub fn new(future: F) -> Self {
+        let registry = Registry::current();
+        let latch = if let Some(worker_thread) = registry.current_raw_thread() {
+            let worker_thread = unsafe { worker_thread.as_ref() }.unwrap();
+            FutureJobLatch::SpinLatch(SpinLatch::new(worker_thread))
+        } else {
+            FutureJobLatch::LockLatch(LockLatch::new())
+        };
+
         Self {
-            latch: {
-                if let Some(worker_thread) = global_registry().current_thread() {
-                    FutureJobLatch::SpinLatch(SpinLatch::new(worker_thread))
-                } else {
-                    FutureJobLatch::LockLatch(LockLatch::new())
-                }
-            },
+            registry,
+            latch,
             future: UnsafeCell::new(future),
             result: UnsafeCell::new(JobResult::None),
             waker: UnsafeCell::new(None),
@@ -312,11 +316,10 @@ where
         'a: 'r,
     {
         let job_ref = unsafe { self.as_job_ref() };
-        let registry = &Registry::current();
 
         // Ensure that registry cannot terminate until FutureJob has completed. This reference is
         // decremented when our FutureJob is finished.
-        registry.increment_terminate_count();
+        self.registry.increment_terminate_count();
 
         match &self.latch {
             FutureJobLatch::SpinLatch(_) => {
@@ -324,7 +327,7 @@ where
                 // directly execute inline here, as `spawn` is meant to express parallelism (we
                 // "fire off" a FutureJob to be executed, hopefully in parallel if another thread
                 // manages to steal the job).
-                registry.inject_or_push(job_ref);
+                self.registry.inject_or_push(job_ref);
             }
             FutureJobLatch::LockLatch(_) => {
                 // If we are on not a worker thread, spawn a regular job that will be execute on a
@@ -346,7 +349,7 @@ where
                     }
                 }));
 
-                registry.inject(&[unsafe { spawn_job.as_job_ref() }]);
+                self.registry.inject(&[unsafe { spawn_job.as_job_ref() }]);
             }
         };
 
@@ -367,7 +370,7 @@ where
     {
         // Ensure that registry cannot terminate until FutureJob has completed. This reference is
         // decremented when our FutureJob is finished.
-        Registry::current().increment_terminate_count();
+        self.registry.increment_terminate_count();
 
         unsafe {
             let future_job_ref = self.as_job_ref();
@@ -603,7 +606,7 @@ where
                 this.latch.set();
 
                 // permit registry to terminate, matching decrement for the increment when we spawned the FutureJob
-                Registry::current().terminate();
+                this.registry.terminate();
             }
             Poll::Pending => {
                 worker_thread.registry().log(|| Event::FutureJobPending {

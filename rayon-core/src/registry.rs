@@ -315,6 +315,21 @@ impl Registry {
         }
     }
 
+    /// Returns the current `WorkerThread` if it's part of this `Registry`.
+    #[must_use]
+    pub(super) fn current_raw_thread(&self) -> Option<*const WorkerThread> {
+        unsafe {
+            let worker_ptr = WorkerThread::current();
+            let worker = worker_ptr.as_ref()?;
+
+            if worker.registry().id() == self.id() {
+                Some(worker_ptr)
+            } else {
+                None
+            }
+        }
+    }
+
     /// Returns an opaque identifier for this registry.
     #[must_use]
     pub(super) fn id(&self) -> RegistryId {
