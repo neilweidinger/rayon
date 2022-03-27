@@ -492,11 +492,7 @@ impl FutureJobWaker {
             .push(self.suspended_job_ref);
 
         // Mark suspended deque as resumable.
-        stealables.update_deque_state(
-            Some(&mut lock),
-            self.suspended_deque_id,
-            DequeState::Resumable,
-        );
+        stealables.update_deque_state(&mut lock, self.suspended_deque_id, DequeState::Resumable);
 
         // If deque already in stealable set, just leave it there, no need to do anything
         if let Some(stealable_set_index) = stealable_set_index {
@@ -624,18 +620,13 @@ where
 
                 // Mark deque as suspended
                 // TODO: get Stealables lock for here and other operations below?
-                stealables.update_deque_state(
-                    Some(&mut lock),
-                    active_deque_id,
-                    DequeState::Suspended,
-                );
+                stealables.update_deque_state(&mut lock, active_deque_id, DequeState::Suspended);
 
                 // Remove deque from stealable set to prevent being stolen from; we will add to a
                 // random stealable set if we see the deque contains other non-suspended jobs. If
                 // it does not, and contains only the one suspended job, this deque will not be
                 // found in any stealable set and as such will not be able to be stolen from.
-                let _ =
-                    stealables.remove_deque_from_stealable_set(Some(&mut lock), active_deque_id);
+                let _ = stealables.remove_deque_from_stealable_set(&mut lock, active_deque_id);
 
                 // If the deque contains non-suspended jobs, it still contains work and can be
                 // stolen from. As such add it to a random victim's stealable set (random victim

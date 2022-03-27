@@ -19,7 +19,7 @@ use std::io;
 use std::mem;
 #[allow(deprecated)]
 use std::sync::atomic::{AtomicUsize, Ordering, ATOMIC_USIZE_INIT};
-use std::sync::{Arc, Mutex, Once};
+use std::sync::{Arc, Once};
 use std::thread;
 use std::usize;
 use worker_thread::WorkerThread;
@@ -34,7 +34,6 @@ pub struct ThreadBuilder {
     registry: Arc<Registry>,
     index: ThreadIndex,
     stealables: Arc<Stealables>,
-    set_to_active_lock: Arc<Mutex<()>>,
 }
 
 impl ThreadBuilder {
@@ -56,14 +55,7 @@ impl ThreadBuilder {
     /// Executes the main loop for this thread. This will not return until the
     /// thread pool is dropped.
     pub fn run(self) {
-        unsafe {
-            main_loop(
-                self.registry,
-                self.index,
-                self.stealables,
-                self.set_to_active_lock,
-            )
-        }
+        unsafe { main_loop(self.registry, self.index, self.stealables) }
     }
 }
 
@@ -249,7 +241,6 @@ impl Registry {
         });
 
         let stealables = Arc::new(Stealables::new(n_threads, registry.clone()));
-        let set_to_active_lock = Arc::new(Mutex::new(()));
 
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
@@ -261,7 +252,6 @@ impl Registry {
                 registry: registry.clone(),
                 index,
                 stealables: stealables.clone(),
-                set_to_active_lock: set_to_active_lock.clone(),
             };
 
             if let Err(e) = builder.get_spawn_handler().spawn(thread) {
@@ -628,12 +618,7 @@ impl ThreadInfo {
     }
 }
 
-unsafe fn main_loop(
-    registry: Arc<Registry>,
-    index: ThreadIndex,
-    stealables: Arc<Stealables>,
-    set_to_active_lock: Arc<Mutex<()>>,
-) {
+unsafe fn main_loop(registry: Arc<Registry>, index: ThreadIndex, stealables: Arc<Stealables>) {
     // this is the only time a WorkerThread is created: this struct represents the state for the
     // current thread running the main loop function, and is used in another functions to retrieve
     // the currently running thread (currently running thread stored in thread local
@@ -641,7 +626,6 @@ unsafe fn main_loop(
     let worker_thread = &WorkerThread::new(
         UnsafeCell::new(None),
         stealables,
-        set_to_active_lock,
         JobFifo::new(),
         index,
         registry.clone(),

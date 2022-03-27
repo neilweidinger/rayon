@@ -219,6 +219,10 @@ pub(super) enum Event {
         deque_id: DequeId,
     },
 
+    DequeDestroyed {
+        deque_id: DequeId,
+    },
+
     DequeStateUpdated {
         deque_id: DequeId,
         deque_state: DequeState,
@@ -242,11 +246,6 @@ pub(super) enum Event {
         stealable_set_index: Option<ThreadIndex>,
         deque_id: DequeId,
         deque_state: DequeState,
-    },
-
-    HandlingEmptyDequeNotFound {
-        thread_doing_handling: ThreadIndex,
-        deque_id: DequeId,
     },
 
     SettingToActive {
