@@ -345,6 +345,14 @@ impl WorkerThread {
                 let (deque_stealer, deque_state, _) =
                     self.stealables.get_deque_stealer_info(victim_deque_id)?;
 
+                self.log(|| JobStealAttempt {
+                    attempt,
+                    worker: self.index,
+                    victim_thread,
+                    victim_deque_id,
+                    deque_state,
+                });
+
                 // There used to be an assert here asserting that stealable_set_index == victim_thread,
                 // but this is not quite accurate as another thread could have moved this victim deque
                 // to another stealable set in the meantime (e.g. when rebalancing). If this happens,
@@ -503,7 +511,12 @@ impl WorkerThread {
             .registry()
             .deque_bench()
             .remove(&victim_deque_id)
-            .expect("Could not find muggable deque in deque bench")
+            .unwrap_or_else(|| {
+                panic!(
+                    "Could not find muggable deque {:?} in deque bench",
+                    victim_deque_id
+                )
+            })
             .1;
         let popped_job = muggable_deque.pop();
         *unsafe { &mut *self.active_deque.get() } = Some(muggable_deque);

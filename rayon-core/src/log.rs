@@ -160,6 +160,14 @@ pub(super) enum Event {
         jobs_remaining: usize,
     },
 
+    JobStealAttempt {
+        attempt: usize,
+        worker: ThreadIndex,
+        victim_thread: ThreadIndex,
+        victim_deque_id: DequeId,
+        deque_state: DequeState,
+    },
+
     /// The given worker has successfully stolen a job from the deque of another.
     JobStolen {
         attempt: usize,
