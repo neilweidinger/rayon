@@ -339,7 +339,7 @@ impl WorkerThread {
         // in these cases we just retry the steal procedure.
         steal_victims_iter(num_threads, self.stealables()).find_map(
             |(attempt, victim_thread, victim_deque_id)| -> Option<JobRef> {
-                let mut lock = self.stealables.get_lock(victim_deque_id)?;
+                let lock = self.stealables.get_lock(victim_deque_id)?;
                 let (deque_stealer, deque_state, _) = lock.value();
                 let deque_state = *deque_state;
 
@@ -369,26 +369,6 @@ impl WorkerThread {
 
                 let stolen_job = deque_stealer.steal();
 
-                // Right after we attempt to steal from the victim deque, we handle the case where
-                // the victim deque is possibly empty. If the deque is not empty and the deque is
-                // marked resumable this means there are more jobs in the deque also waiting to be
-                // executed, so we mark this deque as muggable so that another thread can mug this
-                // entire deque in the future. This should not be done if the steal operation
-                // itself failed, i.e. Steal::Retry
-                let mut handle_resumable_deque = || {
-                    if !self
-                        .stealables
-                        .handle_empty_deque(&mut lock, self.index, victim_deque_id)
-                        && deque_state == DequeState::Resumable
-                    {
-                        self.stealables.update_deque_state(
-                            &mut lock,
-                            victim_deque_id,
-                            DequeState::Muggable,
-                        );
-                    }
-                };
-
                 match stolen_job {
                     Steal::Success(job) => {
                         self.log(|| JobStolen {
@@ -399,9 +379,15 @@ impl WorkerThread {
                             deque_state,
                         });
 
-                        handle_resumable_deque();
-
-                        drop(lock); // Drop lock so we don't run into deadlock
+                        // Right after we attempt to steal from the victim deque, we handle the
+                        // case where the victim deque is possibly empty. If the deque is not empty
+                        // and the deque is marked resumable this means there are more jobs in the
+                        // deque also waiting to be executed, so we mark this deque as muggable so
+                        // that another thread can mug this entire deque in the future. This should
+                        // not be done if the steal operation itself failed, i.e. Steal::Retry.
+                        // Move lock so we avoid any deadlocks.
+                        self.stealables
+                            .handle_deque(lock, self.index, victim_deque_id);
 
                         // This worker thread that is trying to steal may not have an active deque if
                         // during the execution of its last job it encountered a blocked future: the
@@ -426,7 +412,15 @@ impl WorkerThread {
                             deque_state,
                         });
 
-                        handle_resumable_deque();
+                        // Right after we attempt to steal from the victim deque, we handle the
+                        // case where the victim deque is possibly empty. If the deque is not empty
+                        // and the deque is marked resumable this means there are more jobs in the
+                        // deque also waiting to be executed, so we mark this deque as muggable so
+                        // that another thread can mug this entire deque in the future. This should
+                        // not be done if the steal operation itself failed, i.e. Steal::Retry.
+                        // Move lock so we avoid any deadlocks.
+                        self.stealables
+                            .handle_deque(lock, self.index, victim_deque_id);
 
                         None
                     }
@@ -467,10 +461,6 @@ impl WorkerThread {
             return None;
         }
 
-        // Deque is already in some other threads stealable set, so we must rebalance stealables
-        self.stealables
-            .rebalance_stealables(&mut lock, victim_thread);
-
         // Remove deque from previous threads stealable set, and move into this worker threads
         // stealable set
         let _ = self
@@ -485,13 +475,21 @@ impl WorkerThread {
         self.stealables
             .update_deque_state(&mut lock, victim_deque_id, DequeState::Active);
 
-        // We only ever try to steal when we have run out of jobs to pop off on our local currently
-        // active deque, or we have polled a blocked future poll in the last scheduling round,
-        // suspended that deque, and are now trying to find a new deque (hence the if let, since we
-        // could have no active deque in this case). This means if we're ever stealing because
-        // we've run out of jobs on our local active deque, our local active deque must be empty.
-        // Thus, it serves no more use and needs to be freed/discarded/recycled. We also need to
-        // remember to remove the corresponding stealer.
+        // Deque is already in some other threads stealable set, so we must rebalance stealables
+        self.stealables
+            .rebalance_stealables(&mut lock, victim_thread);
+
+        // Drop as soon as we don't need lock to avoid deadlocking
+        drop(lock);
+
+        // Mugging happens here. We only ever try to steal, and consequently mug a deque, when we
+        // have run out of jobs to pop off on our local currently active deque, or we have polled a
+        // blocked future poll in the last scheduling round, suspended that deque, and are now
+        // trying to find a new deque (hence the if let, since we could have no active deque in
+        // this case). This means if we're ever stealing because we've run out of jobs on our local
+        // active deque, our local active deque must be empty. Thus, it serves no more use and
+        // needs to be freed/discarded/recycled. We also need to remember to remove the
+        // corresponding stealer.
         // TODO: possible optimization where we don't free deques, but leave them allocated for
         // later use again (no idea if this would work).
         if let Some(active_deque) = unsafe { &mut *self.active_deque.get() }.take() {
@@ -500,11 +498,6 @@ impl WorkerThread {
                 "Trying to destroy active deque that was not empty"
             );
 
-            // Make sure to drop lock so that `destroy_deque` can get a fresh lock that returns
-            // information appropriate for the deque being destroyed without deadlocking. We cannot
-            // just pass the current lock into `destroy_deque`, since this will return deque
-            // information for the deque we are mugging, not the deque we are destroying.
-            drop(lock);
             self.stealables.destroy_deque(active_deque.id());
 
             // active_deque goes out of scope and gets destroyed

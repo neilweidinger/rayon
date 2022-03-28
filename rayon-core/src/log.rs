@@ -241,7 +241,7 @@ pub(super) enum Event {
         deque_state: DequeState,
     },
 
-    HandlingEmptyDequeNotEmpty {
+    HandlingNonEmptyDeque {
         thread_doing_handling: ThreadIndex,
         stealable_set_index: Option<ThreadIndex>,
         deque_id: DequeId,

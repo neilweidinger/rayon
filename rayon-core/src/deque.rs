@@ -306,24 +306,29 @@ impl Stealables {
     pub(super) fn destroy_deque<'a>(&'a self, deque_id: DequeId) {
         self.registry.as_ref().log(|| DequeDestroyed { deque_id });
 
-        let mut lock = self
-            .get_lock(deque_id)
-            .expect("Deque ID should have been in stealables mapping, but was not found");
+        // Since we did not enter this function holding a lock, it's possible that another thread
+        // has destroyed the deque in the meantime, so if that's the case just do nothing. We
+        // cannot enter this function with a lock, since we would have no way of removing the
+        // key-value in the DashMap without causing a deadlock.
+        if let Some(mut lock) = self.get_lock(deque_id) {
+            // First, remove deque from the stealable set it is currently in
+            let _ = self.remove_deque_from_stealable_set(&mut lock, deque_id);
 
-        // First, remove deque from the stealable set it is currently in
-        let _ = self.remove_deque_from_stealable_set(&mut lock, deque_id);
+            drop(lock); // Drop lock to make sure we do not encounter a deadlock before removing from `deque_stealers`
 
-        drop(lock); // Drop lock to make sure we do not encounter a deadlock before removing from `deque_stealers`
-
-        // Next, remove all data associated with this deque, by letting things go out of scope
-        let _ = self
-            .deque_stealers
-            .remove(&deque_id)
-            .expect("Deque stealer to be destroyed was not found");
+            // Next, remove all data associated with this deque, by letting things go out of scope
+            let _ = self
+                .deque_stealers
+                .remove(&deque_id)
+                .expect("Deque stealer to be destroyed was not found");
+        }
     }
 
-    /// Move a stealable deque from another random victim thread stealable set into this thread's
-    /// stealable set.
+    /// Attempt to move a stealable deque from another random victim thread stealable set into this
+    /// thread's stealable set. We need a lock, since we want the rebalacing operation to be atomic
+    /// (we don't want there to be a split moment where this deque isn't in a stealable set in
+    /// between the removal and adding operations, since that doesn't reflect the true state of the
+    /// deque/stealable sets).
     pub(super) fn rebalance_stealables<'a>(
         &'a self,
         lock: &mut StealablesLock<'a>,
@@ -344,15 +349,13 @@ impl Stealables {
             }
 
             if let Some(stealable_deque_id) = self.get_random_deque_id(victim_index) {
-                // We need a lock, since we want the rebalacing operation to be atomic (we don't
-                // want there to be a split moment where this deque isn't in a stealable set in
-                // between the removal and adding operations, since that doesn't reflect the true
-                // state of the deque/stealable sets)
-
                 let deque_state = lock.value().1;
 
+                // Move deque from victim thread stealable set to this thread stealable set if
+                // deque is not an Active deque
+                // TODO: I think it actually is fine to perform this rebalancing even if the deque
+                // is active
                 if deque_state != DequeState::Active {
-                    // Move deque from victim thread stealable set to this thread stealable set
                     self.remove_deque_from_stealable_set(lock, stealable_deque_id)?;
                     self.add_existing_deque_to_stealable_set(
                         Some(lock),
@@ -378,12 +381,12 @@ impl Stealables {
         }
     }
 
-    /// This method takes care of a deque in a stealable set that is empty (has no jobs to
-    /// execute). This is done here, so that we can take advantage of the internal DashMap lock.
-    /// Returns true if deque is empty.
-    pub(super) fn handle_empty_deque<'a>(
+    /// This method takes the appropriate actions after performing a steal operation on a deque: it
+    /// is responsible for taking care of empty deques, and marking non-empty Resumable deques as
+    /// Muggable.
+    pub(super) fn handle_deque<'a>(
         &'a self,
-        lock: &mut StealablesLock<'a>,
+        mut lock: StealablesLock<'a>,
         index: ThreadIndex,
         deque_id: DequeId,
     ) -> bool {
@@ -400,7 +403,17 @@ impl Stealables {
 
             // This deque is empty and has no jobs to be stolen from, so remove it from
             // its stealable set
-            let removed_thread_index = self.remove_deque_from_stealable_set(lock, deque_id);
+            let removed_thread_index = self.remove_deque_from_stealable_set(&mut lock, deque_id);
+
+            // Only rebalance if this thread was indeed responsible for removal of deque from
+            // stealable set. This is because another thread could have removed this deque from its
+            // stealable set before this thread had a chance to, and if so there is no need for
+            // this thread to perform rebalancing.
+            if let Ok(index) = removed_thread_index {
+                self.rebalance_stealables(&mut lock, index);
+            }
+
+            drop(lock); // Drop as soon as we don't need the lock anymore to avoid deadlocks
 
             // If the deque is not Suspended (Suspended deque can be empty but awaiting
             // suspended future to awake) but is empty, we should destroy/free the
@@ -409,24 +422,22 @@ impl Stealables {
             if deque_state != DequeState::Suspended {
                 // TODO: free deque
                 // TODO: potential deque recycling optimization
+                // self.destroy_deque(deque_id);
             }
 
-            // Only rebalance if this thread was indeed responsible for removal of deque from
-            // stealable set. This is because another thread could have removed this deque from its
-            // stealable set before this thread had a chance to, and if so there is no need for
-            // this thread to perform rebalancing.
-            if let Ok(index) = removed_thread_index {
-                self.rebalance_stealables(lock, index);
-            }
-
-            return true;
+            true
         } else {
-            self.registry.as_ref().log(|| HandlingEmptyDequeNotEmpty {
+            self.registry.as_ref().log(|| HandlingNonEmptyDeque {
                 thread_doing_handling: index,
                 stealable_set_index: *stealable_set_index,
                 deque_id,
                 deque_state,
             });
+
+            // If the deque is NOT empty and is Resumable, we can now mark it as Muggable
+            if deque_state == DequeState::Resumable {
+                self.update_deque_state(&mut lock, deque_id, DequeState::Muggable);
+            }
 
             false
         }

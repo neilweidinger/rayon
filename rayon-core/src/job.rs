@@ -619,7 +619,6 @@ where
                     .expect("Worker thread executing a job erroneously has no active deque");
 
                 // Mark deque as suspended
-                // TODO: get Stealables lock for here and other operations below?
                 stealables.update_deque_state(&mut lock, active_deque_id, DequeState::Suspended);
 
                 // Remove deque from stealable set to prevent being stolen from; we will add to a
