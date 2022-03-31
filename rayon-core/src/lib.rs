@@ -50,6 +50,7 @@
 #![deny(unreachable_pub)]
 #![warn(rust_2018_idioms)]
 
+use core_affinity::CoreId;
 use std::any::Any;
 use std::env;
 use std::error::Error;
@@ -170,6 +171,8 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// "depth-first" fashion. If true, they will do a "breadth-first"
     /// fashion. Depth-first is the default.
     breadth_first: bool,
+
+    pin_cores: Option<Vec<CoreId>>,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -208,6 +211,7 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
+            pin_cores: None,
         }
     }
 }
@@ -227,6 +231,13 @@ where
 {
     /// Creates a new `ThreadPool` initialized using this configuration.
     pub fn build(self) -> Result<ThreadPool, ThreadPoolBuildError> {
+        if let Some(core_ids) = &self.pin_cores {
+            assert!(
+                core_ids.len() == self.num_threads,
+                "Core IDs to pinned to does not match num threads to create ThreadPool with"
+            );
+        }
+
         ThreadPool::build(self)
     }
 
@@ -248,6 +259,13 @@ where
     /// will return an error. An `Ok` result indicates that this
     /// is the first initialization of the thread pool.
     pub fn build_global(self) -> Result<(), ThreadPoolBuildError> {
+        if let Some(core_ids) = &self.pin_cores {
+            assert!(
+                core_ids.len() == self.num_threads,
+                "Core IDs to pinned to does not match num threads to create ThreadPool with"
+            );
+        }
+
         let registry = registry::init_global_registry(self)?;
         registry.wait_until_primed();
         Ok(())
@@ -308,7 +326,13 @@ impl ThreadPoolBuilder {
                     if let Some(size) = thread.stack_size() {
                         builder = builder.stack_size(size);
                     }
-                    builder.spawn(move |_| wrapper(thread))?;
+                    builder.spawn(move |_| {
+                        if let Some(core_id) = thread.pinned_core_id() {
+                            core_affinity::set_for_current(core_id);
+                        }
+
+                        wrapper(thread)
+                    })?;
                     Ok(())
                 })
                 .build()?;
@@ -391,6 +415,7 @@ impl<S> ThreadPoolBuilder<S> {
             start_handler: self.start_handler,
             exit_handler: self.exit_handler,
             breadth_first: self.breadth_first,
+            pin_cores: self.pin_cores,
         }
     }
 
@@ -585,6 +610,18 @@ impl<S> ThreadPoolBuilder<S> {
         self.exit_handler = Some(Box::new(exit_handler));
         self
     }
+
+    /// TODO: Docs
+    pub fn pin(mut self) -> Self {
+        self.pin_cores = Some(core_affinity::get_core_ids().unwrap());
+        self
+    }
+
+    /// TODO: Docs
+    pub fn pin_on_cores(mut self, core_ids: Vec<usize>) -> Self {
+        self.pin_cores = Some(core_ids.into_iter().map(|i| CoreId { id: i }).collect());
+        self
+    }
 }
 
 #[allow(deprecated)]
@@ -714,6 +751,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             ref exit_handler,
             spawn_handler: _,
             ref breadth_first,
+            ref pin_cores,
         } = *self;
 
         // Just print `Some(<closure>)` or `None` to the debug
@@ -737,6 +775,7 @@ impl<S> fmt::Debug for ThreadPoolBuilder<S> {
             .field("start_handler", &start_handler)
             .field("exit_handler", &exit_handler)
             .field("breadth_first", &breadth_first)
+            .field("pin_cores", &pin_cores)
             .finish()
     }
 }

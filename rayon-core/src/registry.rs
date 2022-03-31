@@ -8,6 +8,7 @@ use crate::unwind;
 use crate::{
     ErrorKind, ExitHandler, PanicHandler, StartHandler, ThreadPoolBuildError, ThreadPoolBuilder,
 };
+use core_affinity::CoreId;
 use crossbeam_deque::{Injector, Steal};
 use dashmap::DashMap;
 use std::any::Any;
@@ -34,6 +35,7 @@ pub struct ThreadBuilder {
     registry: Arc<Registry>,
     index: ThreadIndex,
     stealables: Arc<Stealables>,
+    pinned_core_id: Option<CoreId>,
 }
 
 impl ThreadBuilder {
@@ -50,6 +52,11 @@ impl ThreadBuilder {
     /// Gets the value that was specified by `ThreadPoolBuilder::stack_size()`.
     pub fn stack_size(&self) -> Option<usize> {
         self.stack_size
+    }
+
+    /// TODO: Docs
+    pub fn pinned_core_id(&self) -> Option<CoreId> {
+        self.pinned_core_id
     }
 
     /// Executes the main loop for this thread. This will not return until the
@@ -100,7 +107,13 @@ impl ThreadSpawn for DefaultSpawn {
         if let Some(stack_size) = thread.stack_size() {
             b = b.stack_size(stack_size);
         }
-        b.spawn(|| thread.run())?;
+        b.spawn(|| {
+            if let Some(core_id) = thread.pinned_core_id() {
+                core_affinity::set_for_current(core_id);
+            }
+
+            thread.run()
+        })?;
         Ok(())
     }
 }
@@ -241,17 +254,31 @@ impl Registry {
         });
 
         let stealables = Arc::new(Stealables::new(n_threads, registry.clone()));
+        let pinned_core_ids = if builder.pin_cores.is_some() {
+            builder
+                .pin_cores
+                .take()
+                .unwrap()
+                .iter()
+                .map(|i| Some(*i))
+                .collect()
+        } else {
+            vec![None; n_threads]
+        };
+
+        assert!(pinned_core_ids.len() == n_threads);
 
         // If we return early or panic, make sure to terminate existing threads.
         let t1000 = Terminator(&registry);
 
-        for index in 0..n_threads {
+        for (index, pinned_core_id) in (0..n_threads).zip(pinned_core_ids.into_iter()) {
             let thread = ThreadBuilder {
                 name: builder.get_thread_name(index),
                 stack_size: builder.get_stack_size(),
                 registry: registry.clone(),
                 index,
                 stealables: stealables.clone(),
+                pinned_core_id,
             };
 
             if let Err(e) = builder.get_spawn_handler().spawn(thread) {

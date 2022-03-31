@@ -22,6 +22,7 @@ crossbeam-deque = "0.8.1"
 crossbeam-utils = "0.8.0"
 dashmap = "5.1.0"
 pin-utils = "0.1.0"
+core_affinity = "0.5.10"
 
 [dev-dependencies]
 rand = "0.8"
