@@ -124,6 +124,13 @@ enum ErrorKind {
     IOError(io::Error),
 }
 
+#[derive(Debug)]
+enum PinKind {
+    None,
+    All,
+    Selected(Vec<CoreId>),
+}
+
 /// Used to create a new [`ThreadPool`] or to configure the global rayon thread pool.
 /// ## Creating a ThreadPool
 /// The following creates a thread pool with 22 threads.
@@ -172,7 +179,7 @@ pub struct ThreadPoolBuilder<S = DefaultSpawn> {
     /// fashion. Depth-first is the default.
     breadth_first: bool,
 
-    pin_cores: Option<Vec<CoreId>>,
+    pin_cores: PinKind,
 }
 
 /// Contains the rayon thread pool configuration. Use [`ThreadPoolBuilder`] instead.
@@ -211,7 +218,7 @@ impl Default for ThreadPoolBuilder {
             exit_handler: None,
             spawn_handler: DefaultSpawn,
             breadth_first: false,
-            pin_cores: None,
+            pin_cores: PinKind::None,
         }
     }
 }
@@ -231,7 +238,7 @@ where
 {
     /// Creates a new `ThreadPool` initialized using this configuration.
     pub fn build(self) -> Result<ThreadPool, ThreadPoolBuildError> {
-        if let Some(core_ids) = &self.pin_cores {
+        if let PinKind::Selected(core_ids) = &self.pin_cores {
             assert!(
                 core_ids.len() == self.num_threads,
                 "Core IDs to pinned to does not match num threads to create ThreadPool with"
@@ -259,7 +266,7 @@ where
     /// will return an error. An `Ok` result indicates that this
     /// is the first initialization of the thread pool.
     pub fn build_global(self) -> Result<(), ThreadPoolBuildError> {
-        if let Some(core_ids) = &self.pin_cores {
+        if let PinKind::Selected(core_ids) = &self.pin_cores {
             assert!(
                 core_ids.len() == self.num_threads,
                 "Core IDs to pinned to does not match num threads to create ThreadPool with"
@@ -613,13 +620,14 @@ impl<S> ThreadPoolBuilder<S> {
 
     /// TODO: Docs
     pub fn pin(mut self) -> Self {
-        self.pin_cores = Some(core_affinity::get_core_ids().unwrap());
+        self.pin_cores = PinKind::All;
         self
     }
 
     /// TODO: Docs
     pub fn pin_on_cores(mut self, core_ids: Vec<usize>) -> Self {
-        self.pin_cores = Some(core_ids.into_iter().map(|i| CoreId { id: i }).collect());
+        self.pin_cores =
+            PinKind::Selected(core_ids.into_iter().map(|i| CoreId { id: i }).collect());
         self
     }
 }

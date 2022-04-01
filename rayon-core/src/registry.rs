@@ -6,7 +6,8 @@ use crate::log::Logger;
 use crate::sleep::Sleep;
 use crate::unwind;
 use crate::{
-    ErrorKind, ExitHandler, PanicHandler, StartHandler, ThreadPoolBuildError, ThreadPoolBuilder,
+    ErrorKind, ExitHandler, PanicHandler, PinKind, StartHandler, ThreadPoolBuildError,
+    ThreadPoolBuilder,
 };
 use core_affinity::CoreId;
 use crossbeam_deque::{Injector, Steal};
@@ -254,16 +255,19 @@ impl Registry {
         });
 
         let stealables = Arc::new(Stealables::new(n_threads, registry.clone()));
-        let pinned_core_ids = if builder.pin_cores.is_some() {
-            builder
-                .pin_cores
-                .take()
-                .unwrap()
-                .iter()
-                .map(|i| Some(*i))
-                .collect()
-        } else {
-            vec![None; n_threads]
+        let pinned_core_ids = match &builder.pin_cores {
+            PinKind::None => {
+                vec![None; n_threads]
+            }
+            PinKind::All => {
+                let core_ids = core_affinity::get_core_ids().unwrap();
+                core_ids
+                    .into_iter()
+                    .map(|id| Some(id))
+                    .take(n_threads)
+                    .collect()
+            }
+            PinKind::Selected(core_ids) => core_ids.into_iter().map(|&id| Some(id)).collect(),
         };
 
         assert!(pinned_core_ids.len() == n_threads);
