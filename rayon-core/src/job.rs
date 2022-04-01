@@ -369,6 +369,8 @@ where
         // decremented when our FutureJob is finished.
         self.registry.increment_terminate_count();
 
+        // TODO: do we immediately start execution of the FutureJob, or should we just push it to
+        // the deque? In the algorithm we technically just push to the deque.
         unsafe {
             let future_job_ref = self.as_job_ref();
             worker_thread.execute(future_job_ref);

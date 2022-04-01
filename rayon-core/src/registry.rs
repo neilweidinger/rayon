@@ -260,7 +260,9 @@ impl Registry {
                 vec![None; n_threads]
             }
             PinKind::All => {
-                let core_ids = core_affinity::get_core_ids().unwrap();
+                let mut core_ids = core_affinity::get_core_ids().unwrap();
+                core_ids.sort_unstable_by(|a, b| (a.id % 2).cmp(&(b.id % 2))); // pin on physical cores first
+
                 core_ids
                     .into_iter()
                     .map(|id| Some(id))
