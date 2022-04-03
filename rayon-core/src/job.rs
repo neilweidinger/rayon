@@ -330,14 +330,11 @@ where
                 self.registry.inject_or_push(job_ref);
             }
             FutureJobLatch::LockLatch(_) => {
-                // If we are on not a worker thread, spawn a regular job that will be execute on a
+                // If we are on not a worker thread, spawn a regular job that will be executed on a
                 // worker thread in the pool and set our LockLatch when the FutureJob is completed.
                 let future_job_ref = unsafe { self.as_job_ref() };
 
-                // `move` is critical here: we need to make sure `future_job_ref` is moved,
-                // otherwise it will just use a reference to the local variable above that will go
-                // out of scope (dangling reference)
-                let spawn_job = Box::new(HeapJob::new(move || {
+                let spawn_job = Box::new(HeapJob::new(|| {
                     let worker_thread = unsafe {
                         let worker_thread = WorkerThread::current();
                         assert!(!worker_thread.is_null());

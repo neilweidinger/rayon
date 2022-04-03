@@ -98,6 +98,8 @@ impl WorkerThread {
     #[inline]
     #[must_use]
     pub(crate) fn active_deque(&self) -> &UnsafeCell<Option<Deque>> {
+        // It's possible that this worker thread has no active deque (threadpool has just been
+        // created), so create one here on demand
         if unsafe { &*self.active_deque.get() }.is_none() {
             self.create_new_active_deque();
         }

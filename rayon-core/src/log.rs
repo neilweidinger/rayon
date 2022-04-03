@@ -365,9 +365,9 @@ impl Logger {
             }
 
             for event in events.drain(..) {
-                if state.simulate(&event) {
-                    state.dump(&mut writer, &event).unwrap();
-                }
+                // if state.simulate(&event) {
+                state.dump(&mut writer, &event).unwrap();
+                // }
             }
 
             writer.flush().unwrap();
@@ -401,7 +401,7 @@ impl Logger {
                         } else {
                             if events.len() == capacity {
                                 let event = events.pop_front().unwrap();
-                                state.simulate(&event);
+                                // state.simulate(&event);
                                 skipped = true;
                             }
 
@@ -421,7 +421,7 @@ impl Logger {
             for event in events.drain(..) {
                 // In tail mode, we dump *all* events out, whether or
                 // not they were 'interesting' to the state machine.
-                state.simulate(&event);
+                // state.simulate(&event);
                 state.dump(&mut writer, &event).unwrap();
             }
 
@@ -435,7 +435,7 @@ impl Logger {
 
         for event in receiver {
             let mut writer = BufWriter::new(stderr.lock());
-            state.simulate(&event);
+            // state.simulate(&event);
             state.dump(&mut writer, &event).unwrap();
             writer.flush().unwrap();
         }
